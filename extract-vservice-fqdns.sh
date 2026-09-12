@@ -51,6 +51,7 @@ Search Root: ${SEARCH_ROOT}
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
 The special Istio gateway value "mesh" is reported as Mesh Routing = Yes and skipped during Gateway resource validation.
+Environment detection prioritizes the namespace suffix before FQDN and manifest path fallbacks.
 
 FQDN INVENTORY
 --------------
@@ -101,18 +102,55 @@ get_git_remote() {
 }
 
 detect_environment() {
-  local file="$1" namespace="$2" host="$3" text
-  text="$(printf '%s %s %s' "$file" "$namespace" "$host" | tr '[:upper:]' '[:lower:]')"
-  case "$text" in
-    *prod*|*production*) printf '%s' 'PROD' ;;
-    *shadow*) printf '%s' 'SHADOW' ;;
-    *uat*) printf '%s' 'UAT' ;;
-    *stage*|*staging*) printf '%s' 'STAGE' ;;
-    *qa*|*quality*) printf '%s' 'QA' ;;
-    *test*|*tst*) printf '%s' 'TEST' ;;
-    *dev*|*development*) printf '%s' 'DEV' ;;
-    *) printf '%s' 'UNKNOWN' ;;
+  local file="$1" namespace="$2" host="$3"
+  local ns_lower host_lower file_lower
+
+  ns_lower="$(printf '%s' "$namespace" | tr '[:upper:]' '[:lower:]')"
+
+  # Primary rule: environment is the final hyphen-delimited namespace token.
+  # Examples:
+  #   aadt-ddx-ddd-prod   -> PROD
+  #   aadt-exec-dev       -> DEV
+  #   aadt-exec-shadow    -> SHADOW
+  case "$ns_lower" in
+    *-prod|*-production)    printf '%s' 'PROD'; return ;;
+    *-shadow)               printf '%s' 'SHADOW'; return ;;
+    *-uat)                  printf '%s' 'UAT'; return ;;
+    *-stage|*-staging)      printf '%s' 'STAGE'; return ;;
+    *-qa)                   printf '%s' 'QA'; return ;;
+    *-test|*-tst)           printf '%s' 'TEST'; return ;;
+    *-dev|*-development)    printf '%s' 'DEV'; return ;;
   esac
+
+  # Secondary rule: infer from the external/application FQDN.
+  host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host_lower" in
+    *.prod.*|*.production.*|*-prod.*)       printf '%s' 'PROD'; return ;;
+    *.shadow.*|*-shadow.*)                  printf '%s' 'SHADOW'; return ;;
+    *.uat.*|*-uat.*)                        printf '%s' 'UAT'; return ;;
+    *.stage.*|*.staging.*|*-stage.*|*-staging.*)
+                                             printf '%s' 'STAGE'; return ;;
+    *.qa.*|*-qa.*)                          printf '%s' 'QA'; return ;;
+    *.test.*|*.tst.*|*-test.*|*-tst.*)      printf '%s' 'TEST'; return ;;
+    *.dev.*|*.development.*|*-dev.*|*-development.*)
+                                             printf '%s' 'DEV'; return ;;
+  esac
+
+  # Final fallback: inspect the manifest path.
+  file_lower="$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')"
+  case "$file_lower" in
+    */prod/*|*/production/*|*-prod/*)        printf '%s' 'PROD'; return ;;
+    */shadow/*|*-shadow/*)                   printf '%s' 'SHADOW'; return ;;
+    */uat/*|*-uat/*)                         printf '%s' 'UAT'; return ;;
+    */stage/*|*/staging/*|*-stage/*|*-staging/*)
+                                             printf '%s' 'STAGE'; return ;;
+    */qa/*|*-qa/*)                           printf '%s' 'QA'; return ;;
+    */test/*|*/tst/*|*-test/*|*-tst/*)       printf '%s' 'TEST'; return ;;
+    */dev/*|*/development/*|*-dev/*|*-development/*)
+                                             printf '%s' 'DEV'; return ;;
+  esac
+
+  printf '%s' 'UNKNOWN'
 }
 
 is_external_host() {
@@ -610,7 +648,7 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('- Detects wildcard FQDNs.\n')
     out.write('- Detects duplicate external FQDNs.\n')
     out.write('- Reports a missing manifest namespace as `UNKNOWN`.\n')
-    out.write('- Recognizes `SHADOW` when `shadow` appears in the namespace, manifest path, or FQDN.\n')
+    out.write('- Determines environment primarily from the final namespace suffix such as `-prod`, `-dev`, or `-shadow`; FQDN and manifest path are fallbacks.\n')
     out.write('- Captures HTTP route destination service and port.\n')
     out.write('- Captures HTTP URI prefix.\n\n')
     out.write('---\n\n')
@@ -626,9 +664,9 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('---\n\n')
 
     out.write('## Important Notes\n\n')
+    out.write('Environment detection uses the namespace suffix as the primary source. For example, `aadt-ddx-ddd-prod` is `PROD`, `aadt-exec-dev` is `DEV`, and `aadt-exec-shadow` is `SHADOW`.\n\n')
     out.write('`mesh` is an Istio reserved gateway value and is not a Kubernetes Gateway resource. It is therefore shown separately from the external Gateway in this report.\n\n')
     out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest. The namespace may be supplied by Kustomize, Helm, Argo CD, or the deployment pipeline.\n\n')
-    out.write('Namespaces, manifest paths, or FQDNs containing `shadow` are classified under the `SHADOW` environment.\n\n')
     out.write('This report performs static Git manifest analysis and does not verify live EKS resources, DNS resolution, TLS certificates, load balancers, destination Services, or application availability.\n')
 PY
 
