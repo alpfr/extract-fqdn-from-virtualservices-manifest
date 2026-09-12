@@ -105,6 +105,7 @@ detect_environment() {
   text="$(printf '%s %s %s' "$file" "$namespace" "$host" | tr '[:upper:]' '[:lower:]')"
   case "$text" in
     *prod*|*production*) printf '%s' 'PROD' ;;
+    *shadow*) printf '%s' 'SHADOW' ;;
     *uat*) printf '%s' 'UAT' ;;
     *stage*|*staging*) printf '%s' 'STAGE' ;;
     *qa*|*quality*) printf '%s' 'QA' ;;
@@ -609,6 +610,7 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('- Detects wildcard FQDNs.\n')
     out.write('- Detects duplicate external FQDNs.\n')
     out.write('- Reports a missing manifest namespace as `UNKNOWN`.\n')
+    out.write('- Recognizes `SHADOW` when `shadow` appears in the namespace, manifest path, or FQDN.\n')
     out.write('- Captures HTTP route destination service and port.\n')
     out.write('- Captures HTTP URI prefix.\n\n')
     out.write('---\n\n')
@@ -626,6 +628,7 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('## Important Notes\n\n')
     out.write('`mesh` is an Istio reserved gateway value and is not a Kubernetes Gateway resource. It is therefore shown separately from the external Gateway in this report.\n\n')
     out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest. The namespace may be supplied by Kustomize, Helm, Argo CD, or the deployment pipeline.\n\n')
+    out.write('Namespaces, manifest paths, or FQDNs containing `shadow` are classified under the `SHADOW` environment.\n\n')
     out.write('This report performs static Git manifest analysis and does not verify live EKS resources, DNS resolution, TLS certificates, load balancers, destination Services, or application availability.\n')
 PY
 
