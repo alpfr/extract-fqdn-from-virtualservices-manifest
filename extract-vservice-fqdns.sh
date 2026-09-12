@@ -40,35 +40,20 @@ python3 -c 'import yaml' >/dev/null 2>&1 || {
 SEARCH_ROOT="$(cd "$SEARCH_ROOT" && pwd)"
 mkdir -p "$OUTPUT_DIR"
 
-printf '"Environment","Project","Namespace","VirtualService","Gateway","FQDN","DestinationService","DestinationPort","URIPrefix","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
+printf '"Environment","Project","Namespace","VirtualService","Gateway","MeshRouting","FQDN","DestinationService","DestinationPort","URIPrefix","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
 printf '"Environment","Project","Namespace","VirtualService","FQDN","Issue","Manifest"\n' > "$ISSUES_FILE"
 
 cat > "$TEXT_FILE" <<EOF2
-EKS ISTIO VIRTUALSERVICE FQDN INVENTORY
-======================================
+EKS ISTIO VIRTUALSERVICE - EXTERNAL FQDN & ROUTING INVENTORY
+===========================================================
 Generated: $(date '+%Y-%m-%d %H:%M:%S')
 Search Root: ${SEARCH_ROOT}
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
-The special Istio gateway value "mesh" is retained in the inventory but skipped during Gateway resource validation.
+The special Istio gateway value "mesh" is reported as Mesh Routing = Yes and skipped during Gateway resource validation.
 
 FQDN INVENTORY
 --------------
-EOF2
-
-cat > "$CONFLUENCE_FILE" <<EOF2
-# EKS Istio VirtualService FQDN Inventory
-
-Generated: $(date '+%Y-%m-%d %H:%M:%S')
-
-Search root: \`${SEARCH_ROOT}\`
-
-This inventory lists application/external FQDNs configured in Istio VirtualService manifests found in the Git/VS Code workspace. Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded. The special Istio gateway value \`mesh\` is retained for visibility but is not treated as a Gateway resource during validation.
-
-## FQDN Inventory
-
-| Environment | Project | Namespace | VirtualService | Gateway | FQDN | Destination Service | Port | URI Prefix | Owner | Status | Manifest |
-|---|---|---|---|---|---|---|---:|---|---|---|---|
 EOF2
 
 FILES_SCANNED=0
@@ -174,7 +159,6 @@ for doc in docs:
     spec = doc.get('spec') or {}
     labels = meta.get('labels') or {}
 
-    # Do not assume default. Namespace may be injected later by Helm/Kustomize/pipeline.
     namespace = meta.get('namespace') or 'UNKNOWN'
     name = meta.get('name') or 'unknown'
     owner = (
@@ -184,11 +168,14 @@ for doc in docs:
         or '-'
     )
 
-    gateways = spec.get('gateways') or []
-    if not isinstance(gateways, list):
-        gateways = [gateways]
-    gateways = unique(gateways)
-    gateway_text = ','.join(gateways) if gateways else '-'
+    raw_gateways = spec.get('gateways') or []
+    if not isinstance(raw_gateways, list):
+        raw_gateways = [raw_gateways]
+    raw_gateways = unique(raw_gateways)
+
+    mesh_routing = 'Yes' if 'mesh' in raw_gateways else 'No'
+    external_gateways = [g for g in raw_gateways if g != 'mesh']
+    gateway_text = ','.join(external_gateways) if external_gateways else '-'
 
     destination_hosts = []
     destination_ports = []
@@ -237,6 +224,7 @@ for doc in docs:
             name,
             owner,
             gateway_text,
+            mesh_routing,
             clean(host),
             destination_text,
             port_text,
@@ -249,7 +237,6 @@ PY
 gateway_accepts_host() {
   local file="$1" gateway="$2" host="$3" repo_root search_base gw_name gw_ns
   [[ "$gateway" == "-" || -z "$gateway" ]] && return 2
-  [[ "$gateway" == "mesh" ]] && return 2
 
   repo_root="$(get_repo_root "$file" 2>/dev/null || true)"
   search_base="${repo_root:-$(dirname "$file")}"
@@ -298,13 +285,9 @@ for current, dirs, files in os.walk(root):
                     meta = doc.get('metadata') or {}
                     if meta.get('name') != gateway_name:
                         continue
-
-                    # A missing namespace may be injected later by Kustomize/Helm.
-                    # Only enforce namespace equality when the Gateway manifest explicitly declares one.
                     explicit_ns = meta.get('namespace')
                     if gateway_ns and explicit_ns and explicit_ns != gateway_ns:
                         continue
-
                     spec = doc.get('spec') or {}
                     for server in spec.get('servers') or []:
                         if not isinstance(server, dict):
@@ -332,13 +315,14 @@ while IFS= read -r -d '' FILE; do
   REMOTE="$(get_git_remote "$FILE")"
   RELATIVE_FILE="${FILE#${SEARCH_ROOT}/}"
 
-  while IFS=$'\t' read -r NAMESPACE VS_NAME OWNER GATEWAYS HOST DEST_SERVICE DEST_PORT URI_PREFIX; do
+  while IFS=$'\t' read -r NAMESPACE VS_NAME OWNER GATEWAY MESH_ROUTING HOST DEST_SERVICE DEST_PORT URI_PREFIX; do
     [[ -n "$HOST" ]] || continue
 
     NAMESPACE="${NAMESPACE:-UNKNOWN}"
     VS_NAME="${VS_NAME:-unknown}"
     OWNER="${OWNER:--}"
-    GATEWAYS="${GATEWAYS:--}"
+    GATEWAY="${GATEWAY:--}"
+    MESH_ROUTING="${MESH_ROUTING:-No}"
     DEST_SERVICE="${DEST_SERVICE:--}"
     DEST_PORT="${DEST_PORT:--}"
     URI_PREFIX="${URI_PREFIX:--}"
@@ -360,18 +344,16 @@ while IFS= read -r -d '' FILE; do
       ISSUE="Hostname does not match expected FQDN syntax"
     fi
 
-    if [[ "$GATEWAYS" == "-" ]]; then
-      STATUS="MISSING_GATEWAY"
-      ISSUE="VirtualService has no explicit gateway"
+    if [[ "$GATEWAY" == "-" ]]; then
+      if [[ "$MESH_ROUTING" != "Yes" ]]; then
+        STATUS="MISSING_GATEWAY"
+        ISSUE="VirtualService has no explicit gateway"
+      fi
     else
-      IFS=',' read -ra GW_ARRAY <<< "$GATEWAYS"
+      IFS=',' read -ra GW_ARRAY <<< "$GATEWAY"
       for GW in "${GW_ARRAY[@]}"; do
         GW="${GW#${GW%%[![:space:]]*}}"
         GW="${GW%${GW##*[![:space:]]}}"
-
-        # "mesh" is an Istio reserved value for sidecar routing, not a Gateway resource.
-        [[ "$GW" == "mesh" ]] && continue
-
         set +e
         gateway_accepts_host "$FILE" "$GW" "$HOST"
         rc=$?
@@ -389,7 +371,8 @@ while IFS= read -r -d '' FILE; do
       csv_escape "$PROJECT"; printf ','
       csv_escape "$NAMESPACE"; printf ','
       csv_escape "$VS_NAME"; printf ','
-      csv_escape "$GATEWAYS"; printf ','
+      csv_escape "$GATEWAY"; printf ','
+      csv_escape "$MESH_ROUTING"; printf ','
       csv_escape "$HOST"; printf ','
       csv_escape "$DEST_SERVICE"; printf ','
       csv_escape "$DEST_PORT"; printf ','
@@ -406,7 +389,8 @@ Environment         : ${ENVIRONMENT}
 Project             : ${PROJECT}
 Namespace           : ${NAMESPACE}
 VirtualService      : ${VS_NAME}
-Gateway             : ${GATEWAYS}
+Gateway             : ${GATEWAY}
+Mesh Routing        : ${MESH_ROUTING}
 FQDN                : ${HOST}
 Destination Service : ${DEST_SERVICE}
 Destination Port    : ${DEST_PORT}
@@ -418,10 +402,6 @@ Git Remote          : ${REMOTE}
 Manifest            : ${RELATIVE_FILE}
 ------------------------------------------------------------
 EOF2
-
-    printf '| %s | %s | %s | %s | %s | `%s` | %s | %s | `%s` | %s | %s | `%s` |\n' \
-      "$ENVIRONMENT" "$PROJECT" "$NAMESPACE" "$VS_NAME" "$GATEWAYS" "$HOST" \
-      "$DEST_SERVICE" "$DEST_PORT" "$URI_PREFIX" "$OWNER" "$STATUS" "$RELATIVE_FILE" >> "$CONFLUENCE_FILE"
 
     if [[ -n "$ISSUE" ]]; then
       {
@@ -460,7 +440,7 @@ with open(csv_file, newline='', encoding='utf-8') as fh:
 
 with open(dup_file, 'w', encoding='utf-8') as out:
     for fqdn in sorted(k for k, v in counts.items() if v > 1):
-        out.write(fqdn + '\n')
+        out.write(f'{fqdn}\t{counts[fqdn]}\n')
 PY
 
 read -r TOTAL_RECORDS TOTAL_ISSUES TOTAL_FQDNS TOTAL_PROJECTS < <(
@@ -494,26 +474,160 @@ Duplicate FQDNs               : ${DUP_COUNT}
 Internal Hosts Excluded       : ${INTERNAL_HOSTS_EXCLUDED}
 EOF2
 
-cat >> "$CONFLUENCE_FILE" <<EOF2
+python3 - "$CSV_FILE" "$ISSUES_FILE" "$DUP_FILE" "$CONFLUENCE_FILE" "$SEARCH_ROOT" "$FILES_SCANNED" "$TOTAL_PROJECTS" "$TOTAL_FQDNS" "$TOTAL_RECORDS" "$TOTAL_ISSUES" "$DUP_COUNT" "$INTERNAL_HOSTS_EXCLUDED" <<'PY'
+import csv
+import datetime
+import sys
 
-## Summary
+(
+    csv_file,
+    issues_file,
+    dup_file,
+    output_file,
+    search_root,
+    files_scanned,
+    total_projects,
+    total_fqdns,
+    total_records,
+    total_issues,
+    duplicate_count,
+    internal_excluded,
+) = sys.argv[1:]
 
-| Metric | Count |
-|---|---:|
-| YAML Files Scanned | ${FILES_SCANNED} |
-| Projects with FQDN Records | ${TOTAL_PROJECTS} |
-| Unique External FQDNs | ${TOTAL_FQDNS} |
-| VirtualService / FQDN Mappings | ${TOTAL_RECORDS} |
-| Validation Issues | ${TOTAL_ISSUES} |
-| Duplicate FQDNs | ${DUP_COUNT} |
-| Internal Hosts Excluded | ${INTERNAL_HOSTS_EXCLUDED} |
+with open(csv_file, newline='', encoding='utf-8') as fh:
+    rows = list(csv.DictReader(fh))
+with open(issues_file, newline='', encoding='utf-8') as fh:
+    issues = list(csv.DictReader(fh))
 
-## Exclusions and Validation Notes
+duplicates = []
+with open(dup_file, encoding='utf-8') as fh:
+    for line in fh:
+        line = line.rstrip('\n')
+        if not line:
+            continue
+        parts = line.split('\t', 1)
+        duplicates.append((parts[0], parts[1] if len(parts) > 1 else '2'))
 
-- Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded.
-- \`mesh\` is an Istio reserved gateway value and is skipped during Gateway resource lookup.
-- A missing \`metadata.namespace\` is reported as \`UNKNOWN\` because Helm, Kustomize, Argo CD, or deployment pipelines may inject the namespace later.
-EOF2
+def md(value):
+    value = str(value or '-')
+    return value.replace('|', '\\|').replace('\n', ' ')
+
+def code(value):
+    return f'`{md(value)}`'
+
+rows.sort(key=lambda r: (
+    r.get('Environment', ''),
+    r.get('Project', ''),
+    r.get('FQDN', ''),
+    r.get('VirtualService', ''),
+))
+issues.sort(key=lambda r: (
+    r.get('Environment', ''),
+    r.get('Project', ''),
+    r.get('FQDN', ''),
+))
+
+now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+with open(output_file, 'w', encoding='utf-8') as out:
+    out.write('# EKS Istio VirtualService – External FQDN & Routing Inventory\n\n')
+
+    out.write('## Overview\n\n')
+    out.write('This page provides an inventory of external FQDNs configured in Istio VirtualService manifests across application Git repositories.\n\n')
+    out.write('The inventory is generated from Kubernetes/Istio manifests stored in the Git/VS Code workspace. Kubernetes internal hosts ending in `.svc.cluster.local` are excluded.\n\n')
+    out.write(f'**Last Generated:** {now}  \n')
+    out.write(f'**Source:** Git repositories under `{search_root}`  \n')
+    out.write('**Resource:** Istio VirtualService  \n')
+    out.write('**Internal Hosts:** Excluded  \n')
+    out.write('**Generation Method:** Automated manifest scan\n\n')
+    out.write('---\n\n')
+
+    out.write('## Summary\n\n')
+    out.write('| Metric | Count |\n')
+    out.write('|---|---:|\n')
+    out.write(f'| Projects Scanned | {total_projects} |\n')
+    out.write(f'| YAML Files Scanned | {files_scanned} |\n')
+    out.write(f'| VirtualService/FQDN Mappings | {total_records} |\n')
+    out.write(f'| Unique External FQDNs | {total_fqdns} |\n')
+    out.write(f'| Validation Issues | {total_issues} |\n')
+    out.write(f'| Duplicate FQDNs | {duplicate_count} |\n')
+    out.write(f'| Internal Hosts Excluded | {internal_excluded} |\n\n')
+    out.write('---\n\n')
+
+    out.write('## External FQDN & Routing Inventory\n\n')
+    out.write('| Environment | Project | Namespace | VirtualService | External FQDN | Gateway | Mesh Routing | Destination Service | Port | URI | Status |\n')
+    out.write('|---|---|---|---|---|---|---|---|---:|---|---|\n')
+    if rows:
+        for row in rows:
+            out.write(
+                '| {env} | {project} | {namespace} | {vs} | {fqdn} | {gateway} | {mesh} | {dest} | {port} | {uri} | {status} |\n'.format(
+                    env=md(row.get('Environment')),
+                    project=md(row.get('Project')),
+                    namespace=md(row.get('Namespace')),
+                    vs=md(row.get('VirtualService')),
+                    fqdn=code(row.get('FQDN')),
+                    gateway=code(row.get('Gateway')),
+                    mesh=md(row.get('MeshRouting')),
+                    dest=md(row.get('DestinationService')),
+                    port=md(row.get('DestinationPort')),
+                    uri=code(row.get('URIPrefix')),
+                    status=md(row.get('Status')),
+                )
+            )
+    else:
+        out.write('| - | - | - | - | - | - | - | - | - | - | No external FQDNs found |\n')
+    out.write('\n---\n\n')
+
+    out.write('## Validation Issues\n\n')
+    out.write('| Environment | Project | VirtualService | FQDN | Issue |\n')
+    out.write('|---|---|---|---|---|\n')
+    if issues:
+        for issue in issues:
+            out.write(
+                f"| {md(issue.get('Environment'))} | {md(issue.get('Project'))} | {md(issue.get('VirtualService'))} | {code(issue.get('FQDN'))} | {md(issue.get('Issue'))} |\n"
+            )
+    else:
+        out.write('| - | - | - | - | No validation issues found |\n')
+    out.write('\n---\n\n')
+
+    out.write('## Duplicate FQDNs\n\n')
+    out.write('| FQDN | Occurrences |\n')
+    out.write('|---|---:|\n')
+    if duplicates:
+        for fqdn, count in duplicates:
+            out.write(f'| {code(fqdn)} | {md(count)} |\n')
+    else:
+        out.write('| - | 0 |\n')
+    out.write('\n---\n\n')
+
+    out.write('## Validation Rules\n\n')
+    out.write('- Excludes `*.svc.cluster.local`.\n')
+    out.write('- Treats `mesh` as an Istio reserved gateway value rather than a Kubernetes Gateway resource.\n')
+    out.write('- Reports `mesh` separately as **Mesh Routing**.\n')
+    out.write('- Validates non-mesh Gateway references against Gateway manifests in the same Git repository.\n')
+    out.write('- Validates external FQDN syntax.\n')
+    out.write('- Detects wildcard FQDNs.\n')
+    out.write('- Detects duplicate external FQDNs.\n')
+    out.write('- Reports a missing manifest namespace as `UNKNOWN`.\n')
+    out.write('- Captures HTTP route destination service and port.\n')
+    out.write('- Captures HTTP URI prefix.\n\n')
+    out.write('---\n\n')
+
+    out.write('## Status Definitions\n\n')
+    out.write('| Status | Description |\n')
+    out.write('|---|---|\n')
+    out.write('| `VALID` | Configuration passed static validation |\n')
+    out.write('| `WILDCARD` | VirtualService uses a wildcard hostname |\n')
+    out.write('| `NONSTANDARD` | Host does not match expected FQDN syntax |\n')
+    out.write('| `MISSING_GATEWAY` | No explicit Gateway or mesh routing is configured |\n')
+    out.write('| `GATEWAY_HOST_MISMATCH` | FQDN was not found on the referenced non-mesh Gateway |\n\n')
+    out.write('---\n\n')
+
+    out.write('## Important Notes\n\n')
+    out.write('`mesh` is an Istio reserved gateway value and is not a Kubernetes Gateway resource. It is therefore shown separately from the external Gateway in this report.\n\n')
+    out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest. The namespace may be supplied by Kustomize, Helm, Argo CD, or the deployment pipeline.\n\n')
+    out.write('This report performs static Git manifest analysis and does not verify live EKS resources, DNS resolution, TLS certificates, load balancers, destination Services, or application availability.\n')
+PY
 
 echo
 echo "============================================================"
