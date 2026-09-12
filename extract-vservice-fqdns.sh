@@ -4,6 +4,7 @@ set -euo pipefail
 SEARCH_ROOT="${1:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./eks-virtualservice-report}"
 CSV_FILE="${OUTPUT_DIR}/virtualservice_fqdns.csv"
+TEXT_FILE="${OUTPUT_DIR}/virtualservice_fqdns.txt"
 CONFLUENCE_FILE="${OUTPUT_DIR}/virtualservice_fqdns_confluence.md"
 ISSUES_FILE="${OUTPUT_DIR}/virtualservice_issues.csv"
 DUP_FILE="${OUTPUT_DIR}/duplicate_fqdns.txt"
@@ -41,6 +42,18 @@ mkdir -p "$OUTPUT_DIR"
 
 printf '"Environment","Project","Namespace","VirtualService","Gateway","FQDN","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
 printf '"Environment","Project","Namespace","VirtualService","FQDN","Issue","Manifest"\n' > "$ISSUES_FILE"
+
+cat > "$TEXT_FILE" <<EOF2
+EKS ISTIO VIRTUALSERVICE FQDN INVENTORY
+======================================
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+Search Root: ${SEARCH_ROOT}
+
+Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
+
+FQDN INVENTORY
+--------------
+EOF2
 
 cat > "$CONFLUENCE_FILE" <<EOF2
 # EKS Istio VirtualService FQDN Inventory
@@ -313,6 +326,21 @@ while IFS= read -r -d '' FILE; do
       csv_escape "$RELATIVE_FILE"; printf '\n'
     } >> "$CSV_FILE"
 
+    cat >> "$TEXT_FILE" <<EOF2
+Environment    : ${ENVIRONMENT}
+Project        : ${PROJECT}
+Namespace      : ${NAMESPACE}
+VirtualService : ${VS_NAME}
+Gateway        : ${GATEWAYS}
+FQDN           : ${HOST}
+Owner          : ${OWNER}
+Status         : ${STATUS}
+Git Branch     : ${BRANCH}
+Git Remote     : ${REMOTE}
+Manifest       : ${RELATIVE_FILE}
+------------------------------------------------------------
+EOF2
+
     printf '| %s | %s | %s | %s | %s | `%s` | %s | %s | `%s` |\n' \
       "$ENVIRONMENT" "$PROJECT" "$NAMESPACE" "$VS_NAME" "$GATEWAYS" "$HOST" "$OWNER" "$STATUS" "$RELATIVE_FILE" >> "$CONFLUENCE_FILE"
 
@@ -374,6 +402,19 @@ PY
 )
 DUP_COUNT="$(wc -l < "$DUP_FILE" | tr -d ' ')"
 
+cat >> "$TEXT_FILE" <<EOF2
+
+SUMMARY
+-------
+YAML Files Scanned            : ${FILES_SCANNED}
+Projects with FQDN Records    : ${TOTAL_PROJECTS}
+Unique External FQDNs         : ${TOTAL_FQDNS}
+VirtualService/FQDN Mappings  : ${TOTAL_RECORDS}
+Validation Issues             : ${TOTAL_ISSUES}
+Duplicate FQDNs               : ${DUP_COUNT}
+Internal Hosts Excluded       : ${INTERNAL_HOSTS_EXCLUDED}
+EOF2
+
 cat >> "$CONFLUENCE_FILE" <<EOF2
 
 ## Summary
@@ -406,6 +447,7 @@ echo "Duplicate FQDNs:          $DUP_COUNT"
 echo "Internal hosts excluded:  $INTERNAL_HOSTS_EXCLUDED"
 echo
 echo "CSV report:               $CSV_FILE"
+echo "Text report:              $TEXT_FILE"
 echo "Issues report:            $ISSUES_FILE"
 echo "Duplicate FQDN list:      $DUP_FILE"
 echo "Confluence report:        $CONFLUENCE_FILE"
