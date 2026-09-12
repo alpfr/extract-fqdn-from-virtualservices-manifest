@@ -11,7 +11,9 @@ This version does **not** use `yq`. YAML parsing is performed with Python 3 and 
 - Searches all `*.yaml` and `*.yml` files below a workspace root.
 - Extracts `spec.hosts[]` from Istio `VirtualService` resources.
 - Excludes Kubernetes internal hosts ending in `.svc.cluster.local`.
-- Detects `DEV`, `TEST`, `QA`, `UAT`, `STAGE`, `SHADOW`, and `PROD` from path, namespace, and hostname.
+- Detects `DEV`, `TEST`, `QA`, `UAT`, `STAGE`, `SHADOW`, and `PROD`.
+- Prioritizes the final namespace suffix for environment detection.
+- Falls back to the external FQDN and then manifest path when the namespace does not identify an environment.
 - Captures project, namespace, VirtualService, external Gateway, mesh-routing indicator, owner/team, Git branch, Git remote, and manifest path.
 - Captures HTTP route destination service, destination port, and URI prefix.
 - Treats Istio's special `mesh` gateway correctly: it is reported separately as Mesh Routing and skipped during Gateway resource lookup.
@@ -20,7 +22,7 @@ This version does **not** use `yq`. YAML parsing is performed with Python 3 and 
 - Flags VirtualServices without an explicit Gateway or mesh routing.
 - Performs static VirtualService-to-Gateway hostname validation against Gateway manifests in the same Git repository.
 - Detects duplicate FQDNs.
-- Generates both a human-readable `.txt` report and a structured Confluence-ready `.md` page.
+- Generates a human-readable `.txt` report and a structured Confluence-ready `.md` page.
 
 ## Requirements
 
@@ -77,7 +79,30 @@ eks-virtualservice-report/
 
 ## Environment detection
 
-The script checks the manifest path, namespace, and FQDN and reports one of:
+Environment detection uses this priority:
+
+```text
+1. Namespace suffix
+2. External FQDN
+3. Manifest path
+4. UNKNOWN
+```
+
+The standard namespace convention is `<application-or-team>-<environment>`. The final hyphen-delimited token is treated as the environment when it matches a supported value.
+
+Examples:
+
+| Namespace | Environment |
+|---|---|
+| `aadt-ddx-ddd-prod` | `PROD` |
+| `aadt-exec-dev` | `DEV` |
+| `aadt-exec-shadow` | `SHADOW` |
+| `aadt-service-qa` | `QA` |
+| `aadt-api-uat` | `UAT` |
+| `aadt-app-stage` | `STAGE` |
+| `aadt-app-test` | `TEST` |
+
+Supported values are:
 
 ```text
 DEV
@@ -90,27 +115,15 @@ PROD
 UNKNOWN
 ```
 
-For example, a VirtualService with an explicitly declared namespace such as:
+Using the namespace suffix first prevents an unrelated environment word elsewhere in the repository path or hostname from overriding the explicitly named namespace environment.
 
-```yaml
-metadata:
-  namespace: shadow
-```
-
-is reported as:
-
-```text
-Environment : SHADOW
-Namespace   : shadow
-```
-
-The same `SHADOW` classification applies when `shadow` is found in the manifest path or external FQDN.
+If the namespace is `UNKNOWN` or does not end in a recognized environment suffix, the script checks the external FQDN. The manifest path is used only as the final environment fallback.
 
 ## Main inventory fields
 
 | Field | Description |
 |---|---|
-| Environment | Inferred DEV/TEST/QA/UAT/STAGE/SHADOW/PROD environment |
+| Environment | Environment determined using namespace suffix first, then FQDN/path fallback |
 | Project | Git repository/project name |
 | Namespace | Manifest namespace, or `UNKNOWN` when not explicitly declared |
 | VirtualService | Istio VirtualService name |
@@ -133,7 +146,7 @@ apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: elasticsearch-cronjob-build-deploy-pipeline-vservice
-  namespace: shadow
+  namespace: aadt-exec-shadow
 spec:
   hosts:
     - elasticsearch-cronjob-build-deploy.shadow.mesh.abc.mod.com
@@ -152,7 +165,14 @@ spec:
               number: 443
 ```
 
-The report includes the external host and classifies the record as `SHADOW`, while excluding the `.svc.cluster.local` hostname.
+The report includes the external host and reports:
+
+```text
+Environment : SHADOW
+Namespace   : aadt-exec-shadow
+```
+
+The `.svc.cluster.local` hostname is excluded.
 
 ## Istio `mesh` gateway handling
 
