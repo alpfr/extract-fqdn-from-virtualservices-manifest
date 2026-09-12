@@ -40,7 +40,7 @@ python3 -c 'import yaml' >/dev/null 2>&1 || {
 SEARCH_ROOT="$(cd "$SEARCH_ROOT" && pwd)"
 mkdir -p "$OUTPUT_DIR"
 
-printf '"Environment","Project","Namespace","VirtualService","Gateway","FQDN","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
+printf '"Environment","Project","Namespace","VirtualService","Gateway","FQDN","DestinationService","DestinationPort","URIPrefix","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
 printf '"Environment","Project","Namespace","VirtualService","FQDN","Issue","Manifest"\n' > "$ISSUES_FILE"
 
 cat > "$TEXT_FILE" <<EOF2
@@ -50,6 +50,7 @@ Generated: $(date '+%Y-%m-%d %H:%M:%S')
 Search Root: ${SEARCH_ROOT}
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
+The special Istio gateway value "mesh" is retained in the inventory but skipped during Gateway resource validation.
 
 FQDN INVENTORY
 --------------
@@ -62,12 +63,12 @@ Generated: $(date '+%Y-%m-%d %H:%M:%S')
 
 Search root: \`${SEARCH_ROOT}\`
 
-This inventory lists application/external FQDNs configured in Istio VirtualService manifests found in the Git/VS Code workspace. Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded.
+This inventory lists application/external FQDNs configured in Istio VirtualService manifests found in the Git/VS Code workspace. Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded. The special Istio gateway value \`mesh\` is retained for visibility but is not treated as a Gateway resource during validation.
 
 ## FQDN Inventory
 
-| Environment | Project | Namespace | VirtualService | Gateway | FQDN | Owner | Status | Manifest |
-|---|---|---|---|---|---|---|---|---|
+| Environment | Project | Namespace | VirtualService | Gateway | FQDN | Destination Service | Port | URI Prefix | Owner | Status | Manifest |
+|---|---|---|---|---|---|---|---:|---|---|---|---|
 EOF2
 
 FILES_SCANNED=0
@@ -152,6 +153,19 @@ try:
 except Exception:
     sys.exit(0)
 
+def clean(value):
+    return str(value).replace('\t', ' ').replace('\n', ' ')
+
+def unique(values):
+    result = []
+    seen = set()
+    for value in values:
+        value = clean(value)
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
 for doc in docs:
     if not isinstance(doc, dict) or doc.get('kind') != 'VirtualService':
         continue
@@ -160,7 +174,8 @@ for doc in docs:
     spec = doc.get('spec') or {}
     labels = meta.get('labels') or {}
 
-    namespace = meta.get('namespace') or 'default'
+    # Do not assume default. Namespace may be injected later by Helm/Kustomize/pipeline.
+    namespace = meta.get('namespace') or 'UNKNOWN'
     name = meta.get('name') or 'unknown'
     owner = (
         labels.get('app.kubernetes.io/owner')
@@ -171,8 +186,44 @@ for doc in docs:
 
     gateways = spec.get('gateways') or []
     if not isinstance(gateways, list):
-        gateways = [str(gateways)]
-    gateway_text = ','.join(str(x) for x in gateways) if gateways else '-'
+        gateways = [gateways]
+    gateways = unique(gateways)
+    gateway_text = ','.join(gateways) if gateways else '-'
+
+    destination_hosts = []
+    destination_ports = []
+    uri_prefixes = []
+
+    for http in spec.get('http') or []:
+        if not isinstance(http, dict):
+            continue
+
+        for match in http.get('match') or []:
+            if not isinstance(match, dict):
+                continue
+            uri = match.get('uri') or {}
+            if isinstance(uri, dict) and uri.get('prefix') is not None:
+                uri_prefixes.append(uri.get('prefix'))
+
+        for route in http.get('route') or []:
+            if not isinstance(route, dict):
+                continue
+            destination = route.get('destination') or {}
+            if not isinstance(destination, dict):
+                continue
+            if destination.get('host') is not None:
+                destination_hosts.append(destination.get('host'))
+            port = destination.get('port') or {}
+            if isinstance(port, dict) and port.get('number') is not None:
+                destination_ports.append(port.get('number'))
+
+    destination_hosts = unique(destination_hosts)
+    destination_ports = unique(destination_ports)
+    uri_prefixes = unique(uri_prefixes)
+
+    destination_text = ','.join(destination_hosts) if destination_hosts else '-'
+    port_text = ','.join(destination_ports) if destination_ports else '-'
+    prefix_text = ','.join(uri_prefixes) if uri_prefixes else '-'
 
     hosts = spec.get('hosts') or []
     if not isinstance(hosts, list):
@@ -181,14 +232,24 @@ for doc in docs:
     for host in hosts:
         if host is None:
             continue
-        values = [namespace, name, owner, gateway_text, str(host)]
-        print('\t'.join(v.replace('\t', ' ').replace('\n', ' ') for v in values))
+        values = [
+            namespace,
+            name,
+            owner,
+            gateway_text,
+            clean(host),
+            destination_text,
+            port_text,
+            prefix_text,
+        ]
+        print('\t'.join(clean(v) for v in values))
 PY
 }
 
 gateway_accepts_host() {
   local file="$1" gateway="$2" host="$3" repo_root search_base gw_name gw_ns
   [[ "$gateway" == "-" || -z "$gateway" ]] && return 2
+  [[ "$gateway" == "mesh" ]] && return 2
 
   repo_root="$(get_repo_root "$file" 2>/dev/null || true)"
   search_base="${repo_root:-$(dirname "$file")}"
@@ -237,9 +298,13 @@ for current, dirs, files in os.walk(root):
                     meta = doc.get('metadata') or {}
                     if meta.get('name') != gateway_name:
                         continue
-                    ns = meta.get('namespace') or 'default'
-                    if gateway_ns and ns != gateway_ns:
+
+                    # A missing namespace may be injected later by Kustomize/Helm.
+                    # Only enforce namespace equality when the Gateway manifest explicitly declares one.
+                    explicit_ns = meta.get('namespace')
+                    if gateway_ns and explicit_ns and explicit_ns != gateway_ns:
                         continue
+
                     spec = doc.get('spec') or {}
                     for server in spec.get('servers') or []:
                         if not isinstance(server, dict):
@@ -267,13 +332,16 @@ while IFS= read -r -d '' FILE; do
   REMOTE="$(get_git_remote "$FILE")"
   RELATIVE_FILE="${FILE#${SEARCH_ROOT}/}"
 
-  while IFS=$'\t' read -r NAMESPACE VS_NAME OWNER GATEWAYS HOST; do
+  while IFS=$'\t' read -r NAMESPACE VS_NAME OWNER GATEWAYS HOST DEST_SERVICE DEST_PORT URI_PREFIX; do
     [[ -n "$HOST" ]] || continue
 
-    NAMESPACE="${NAMESPACE:-default}"
+    NAMESPACE="${NAMESPACE:-UNKNOWN}"
     VS_NAME="${VS_NAME:-unknown}"
     OWNER="${OWNER:--}"
     GATEWAYS="${GATEWAYS:--}"
+    DEST_SERVICE="${DEST_SERVICE:--}"
+    DEST_PORT="${DEST_PORT:--}"
+    URI_PREFIX="${URI_PREFIX:--}"
 
     if ! is_external_host "$HOST"; then
       ((INTERNAL_HOSTS_EXCLUDED+=1))
@@ -300,6 +368,10 @@ while IFS= read -r -d '' FILE; do
       for GW in "${GW_ARRAY[@]}"; do
         GW="${GW#${GW%%[![:space:]]*}}"
         GW="${GW%${GW##*[![:space:]]}}"
+
+        # "mesh" is an Istio reserved value for sidecar routing, not a Gateway resource.
+        [[ "$GW" == "mesh" ]] && continue
+
         set +e
         gateway_accepts_host "$FILE" "$GW" "$HOST"
         rc=$?
@@ -319,6 +391,9 @@ while IFS= read -r -d '' FILE; do
       csv_escape "$VS_NAME"; printf ','
       csv_escape "$GATEWAYS"; printf ','
       csv_escape "$HOST"; printf ','
+      csv_escape "$DEST_SERVICE"; printf ','
+      csv_escape "$DEST_PORT"; printf ','
+      csv_escape "$URI_PREFIX"; printf ','
       csv_escape "$OWNER"; printf ','
       csv_escape "$STATUS"; printf ','
       csv_escape "$BRANCH"; printf ','
@@ -327,22 +402,26 @@ while IFS= read -r -d '' FILE; do
     } >> "$CSV_FILE"
 
     cat >> "$TEXT_FILE" <<EOF2
-Environment    : ${ENVIRONMENT}
-Project        : ${PROJECT}
-Namespace      : ${NAMESPACE}
-VirtualService : ${VS_NAME}
-Gateway        : ${GATEWAYS}
-FQDN           : ${HOST}
-Owner          : ${OWNER}
-Status         : ${STATUS}
-Git Branch     : ${BRANCH}
-Git Remote     : ${REMOTE}
-Manifest       : ${RELATIVE_FILE}
+Environment         : ${ENVIRONMENT}
+Project             : ${PROJECT}
+Namespace           : ${NAMESPACE}
+VirtualService      : ${VS_NAME}
+Gateway             : ${GATEWAYS}
+FQDN                : ${HOST}
+Destination Service : ${DEST_SERVICE}
+Destination Port    : ${DEST_PORT}
+URI Prefix          : ${URI_PREFIX}
+Owner               : ${OWNER}
+Status              : ${STATUS}
+Git Branch          : ${BRANCH}
+Git Remote          : ${REMOTE}
+Manifest            : ${RELATIVE_FILE}
 ------------------------------------------------------------
 EOF2
 
-    printf '| %s | %s | %s | %s | %s | `%s` | %s | %s | `%s` |\n' \
-      "$ENVIRONMENT" "$PROJECT" "$NAMESPACE" "$VS_NAME" "$GATEWAYS" "$HOST" "$OWNER" "$STATUS" "$RELATIVE_FILE" >> "$CONFLUENCE_FILE"
+    printf '| %s | %s | %s | %s | %s | `%s` | %s | %s | `%s` | %s | %s | `%s` |\n' \
+      "$ENVIRONMENT" "$PROJECT" "$NAMESPACE" "$VS_NAME" "$GATEWAYS" "$HOST" \
+      "$DEST_SERVICE" "$DEST_PORT" "$URI_PREFIX" "$OWNER" "$STATUS" "$RELATIVE_FILE" >> "$CONFLUENCE_FILE"
 
     if [[ -n "$ISSUE" ]]; then
       {
@@ -429,9 +508,11 @@ cat >> "$CONFLUENCE_FILE" <<EOF2
 | Duplicate FQDNs | ${DUP_COUNT} |
 | Internal Hosts Excluded | ${INTERNAL_HOSTS_EXCLUDED} |
 
-## Exclusions
+## Exclusions and Validation Notes
 
-Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded from this inventory.
+- Kubernetes internal service hostnames ending in \`.svc.cluster.local\` are excluded.
+- \`mesh\` is an Istio reserved gateway value and is skipped during Gateway resource lookup.
+- A missing \`metadata.namespace\` is reported as \`UNKNOWN\` because Helm, Kustomize, Argo CD, or deployment pipelines may inject the namespace later.
 EOF2
 
 echo
