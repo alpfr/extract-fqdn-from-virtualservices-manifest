@@ -1,6 +1,6 @@
 # Extract FQDNs from Istio VirtualService Manifests
 
-Recursively scans a local Git/VS Code workspace for Istio `VirtualService` YAML manifests and builds an external FQDN inventory in CSV, plain-text, and Confluence-ready Markdown formats.
+Recursively scans a local Git/VS Code workspace for Istio `VirtualService` YAML manifests and builds an external FQDN and routing inventory in CSV, plain-text, and Confluence-ready Markdown formats.
 
 ## No `yq` requirement
 
@@ -13,6 +13,9 @@ This version does **not** use `yq`. YAML parsing is performed with Python 3 and 
 - Excludes Kubernetes internal hosts ending in `.svc.cluster.local`.
 - Detects `DEV`, `TEST`, `QA`, `UAT`, `STAGE`, and `PROD` from path, namespace, and hostname.
 - Captures project, namespace, VirtualService, Gateway, owner/team, Git branch, Git remote, and manifest path.
+- Captures HTTP route destination service, destination port, and URI prefix.
+- Treats Istio's special `mesh` gateway correctly: it is shown in reports but skipped during Gateway resource lookup.
+- Reports a missing manifest namespace as `UNKNOWN` rather than assuming `default`.
 - Flags wildcard and malformed hostnames.
 - Flags VirtualServices without an explicit Gateway.
 - Performs static VirtualService-to-Gateway hostname validation against Gateway manifests in the same Git repository.
@@ -72,78 +75,103 @@ eks-virtualservice-report/
 └── duplicate_fqdns.txt
 ```
 
-### `virtualservice_fqdns.txt`
+## Main inventory fields
 
-Human-readable text inventory suitable for attachments, email, terminal review, or archival.
+| Field | Description |
+|---|---|
+| Environment | Inferred DEV/TEST/QA/UAT/STAGE/PROD environment |
+| Project | Git repository/project name |
+| Namespace | Manifest namespace, or `UNKNOWN` when not explicitly declared |
+| VirtualService | Istio VirtualService name |
+| Gateway | All values from `spec.gateways`, including `mesh` |
+| FQDN | External/application hostname |
+| Destination Service | HTTP route destination host/service |
+| Destination Port | HTTP route destination port |
+| URI Prefix | URI prefix from HTTP match rules |
+| Owner | Owner/team label when available |
+| Status | Static validation result |
+| Git Branch | Current local repository branch |
+| Git Remote | Git origin URL |
+| Manifest | Manifest path relative to workspace root |
 
-Example:
-
-```text
-Environment    : DEV
-Project        : elasticsearch-project
-Namespace      : elasticsearch
-VirtualService : elasticsearch-vservice
-Gateway        : istio-system/public-gateway
-FQDN           : elasticsearch.dev.mesh.abc.mod.com
-Owner          : search-team
-Status         : VALID
-Git Branch     : main
-Git Remote     : https://github.com/example/elasticsearch-project.git
-Manifest       : elasticsearch-project/k8s/dev/virtualservice.yaml
-------------------------------------------------------------
-```
-
-The text report ends with summary counts for files scanned, projects, unique external FQDNs, mappings, validation issues, duplicates, and excluded internal hosts.
-
-### `virtualservice_fqdns_confluence.md`
-
-Confluence-ready Markdown inventory containing the external FQDN table and summary metrics.
-
-Example:
-
-| Environment | Project | Namespace | VirtualService | Gateway | FQDN | Owner | Status | Manifest |
-|---|---|---|---|---|---|---|---|---|
-| DEV | elasticsearch-project | elasticsearch | elasticsearch-vservice | istio-system/public-gateway | `elasticsearch.dev.mesh.abc.mod.com` | search-team | VALID | `elasticsearch-project/k8s/dev/virtualservice.yaml` |
-
-### `virtualservice_fqdns.csv`
-
-Machine-readable canonical inventory for spreadsheets, automation, and downstream analysis.
-
-### `virtualservice_issues.csv`
-
-Contains validation findings such as malformed hostnames, wildcard hosts, missing Gateways, and Gateway hostname mismatches.
-
-### `duplicate_fqdns.txt`
-
-Contains FQDNs that occur more than once in the generated inventory.
-
-## Sample VirtualService
+## Real-world VirtualService pattern
 
 ```yaml
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
-  name: elasticsearch-vservice
-  namespace: elasticsearch
+  name: elasticsearch-cronjob-build-deploy-pipeline-vservice
 spec:
-  gateways:
-    - istio-system/public-gateway
   hosts:
-    - elasticsearch.dev.mesh.abc.mod.com
-    - elasticsearch.svc.cluster.local
+    - elasticsearch-cronjob-build-deploy.dev.mesh.abc.mod.com
+    - elasticsearch-cronjob-build-deploy-pipeline.svc.cluster.local
+  gateways:
+    - mesh
+    - istio-ingress/default-gateway
+  http:
+    - match:
+        - uri:
+            prefix: "/"
+      route:
+        - destination:
+            host: elasticsearch-cronjob-build-deploy-pipeline-service
+            port:
+              number: 443
 ```
 
-Included:
+The report includes the external host:
 
 ```text
-elasticsearch.dev.mesh.abc.mod.com
+elasticsearch-cronjob-build-deploy.dev.mesh.abc.mod.com
 ```
 
-Excluded:
+and excludes:
 
 ```text
-elasticsearch.svc.cluster.local
+elasticsearch-cronjob-build-deploy-pipeline.svc.cluster.local
 ```
+
+The route information is captured as:
+
+```text
+Destination Service : elasticsearch-cronjob-build-deploy-pipeline-service
+Destination Port    : 443
+URI Prefix          : /
+```
+
+Because the sample does not explicitly declare `metadata.namespace`, the report uses:
+
+```text
+Namespace : UNKNOWN
+```
+
+## Istio `mesh` gateway handling
+
+A VirtualService can contain:
+
+```yaml
+gateways:
+  - mesh
+  - istio-ingress/default-gateway
+```
+
+`mesh` is an Istio reserved value representing sidecar/mesh routing. It is not the name of a Kubernetes `Gateway` resource. The script therefore:
+
+1. Keeps `mesh` in the inventory so the source manifest is represented accurately.
+2. Does **not** search Git for a Gateway resource named `mesh`.
+3. Validates the external FQDN against `istio-ingress/default-gateway` when that Gateway manifest is available in the same repository.
+
+## Missing namespace handling
+
+The script deliberately does not assume that a VirtualService without `metadata.namespace` belongs to `default`.
+
+It reports:
+
+```text
+UNKNOWN
+```
+
+This avoids a false namespace assignment when Helm, Kustomize, Argo CD, or a deployment pipeline supplies the namespace at deployment time.
 
 ## Status values
 
@@ -153,29 +181,41 @@ elasticsearch.svc.cluster.local
 | `WILDCARD` | Host is a wildcard FQDN |
 | `NONSTANDARD` | Host does not match basic FQDN syntax |
 | `MISSING_GATEWAY` | VirtualService has no explicit Gateway |
-| `GATEWAY_HOST_MISMATCH` | Host was not found on the referenced Gateway in repository manifests |
+| `GATEWAY_HOST_MISMATCH` | Host was not found on a referenced non-`mesh` Gateway in repository manifests |
 
 ## Gateway validation
 
-When a VirtualService references a Gateway, the script searches YAML manifests in the same Git repository and checks `Gateway.spec.servers[].hosts`. Exact hosts, `*`, wildcard domains, and namespace-qualified Istio Gateway host patterns are supported.
+For non-`mesh` Gateway references, the script searches YAML manifests in the same Git repository and checks `Gateway.spec.servers[].hosts`. Exact hosts, `*`, wildcard domains, and namespace-qualified Istio Gateway host patterns are supported.
 
-This is static source-control validation. It does not prove that deployed EKS/Istio configuration, DNS, load balancers, certificates, or backend services are healthy.
+A Gateway manifest with no explicit namespace is not automatically treated as `default`; namespace matching is enforced only when the Gateway manifest explicitly declares one.
 
-## Environment detection
+This is static source-control validation. It does not prove that deployed EKS/Istio configuration, DNS, load balancers, certificates, destination Services, or workloads are healthy.
 
-Environment is inferred from manifest path, namespace, and FQDN. Recognized values are:
+## Output examples
+
+### Plain text
 
 ```text
-PROD
-UAT
-STAGE
-QA
-TEST
-DEV
-UNKNOWN
+Environment         : DEV
+Project             : example-project
+Namespace           : UNKNOWN
+VirtualService      : elasticsearch-cronjob-build-deploy-pipeline-vservice
+Gateway             : mesh,istio-ingress/default-gateway
+FQDN                : elasticsearch-cronjob-build-deploy.dev.mesh.abc.mod.com
+Destination Service : elasticsearch-cronjob-build-deploy-pipeline-service
+Destination Port    : 443
+URI Prefix          : /
+Owner               : -
+Status              : VALID
+Git Branch          : main
+Manifest            : example-project/k8s/dev/virtualservice.yaml
 ```
 
-For stronger governance, standardize an environment label or repository metadata field and make that the authoritative source.
+### Confluence
+
+| Environment | Project | Namespace | VirtualService | Gateway | FQDN | Destination Service | Port | URI Prefix | Owner | Status | Manifest |
+|---|---|---|---|---|---|---|---:|---|---|---|---|
+| DEV | example-project | UNKNOWN | elasticsearch-cronjob-build-deploy-pipeline-vservice | mesh,istio-ingress/default-gateway | `elasticsearch-cronjob-build-deploy.dev.mesh.abc.mod.com` | elasticsearch-cronjob-build-deploy-pipeline-service | 443 | `/` | - | VALID | `example-project/k8s/dev/virtualservice.yaml` |
 
 ## Recommended workflow
 
@@ -187,14 +227,10 @@ For stronger governance, standardize an environment label or repository metadata
 6. Copy/import `virtualservice_fqdns_confluence.md` into Confluence.
 7. Investigate validation findings before treating the inventory as authoritative.
 
-## CI recommendation
-
-Run the script in CI and retain all generated files as build artifacts. A future stricter mode can fail CI selectively for malformed production FQDNs, duplicate production FQDNs, or Gateway hostname mismatches.
-
 ## Security and operational notes
 
 - No EKS/Kubernetes cluster access is required.
 - Kubernetes Secrets are not queried or output.
 - Do not store TLS private keys or credentials in generated reports.
-- DNS resolution and TLS certificate validation are outside the current static-analysis scope.
+- DNS resolution, TLS certificate validation, and live Service/workload validation are outside the current static-analysis scope.
 - Generated reports are ignored by Git by default.
