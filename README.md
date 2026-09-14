@@ -50,8 +50,15 @@ If package installation is restricted, use an approved Python environment contai
 
 ## Usage
 
+Make the script executable:
+
 ```bash
 chmod +x extract-vservice-fqdns.sh
+```
+
+Normal scan:
+
+```bash
 ./extract-vservice-fqdns.sh /path/to/git/workspace
 ```
 
@@ -59,6 +66,12 @@ Example:
 
 ```bash
 ./extract-vservice-fqdns.sh /opt/apps/git
+```
+
+Show command help:
+
+```bash
+./extract-vservice-fqdns.sh --help
 ```
 
 ### Dry-run
@@ -86,7 +99,29 @@ Dry-run mode:
 
 This makes dry-run useful for validating the search root and reviewing discovered FQDNs before creating the final inventory.
 
-Custom output directory for a normal run:
+A successful dry-run ends with output similar to:
+
+```text
+============================================================
+VirtualService FQDN inventory dry-run completed
+============================================================
+Search root:              /opt/apps/git
+YAML files scanned:       125
+Projects:                 14
+Unique external FQDNs:    32
+Validation issues:        3
+Duplicate FQDNs:          1
+Internal hosts excluded:  28
+
+DRY-RUN: No report files were written to:
+  ./eks-virtualservice-report
+```
+
+The script then displays the detailed text inventory under `DRY-RUN REPORT PREVIEW`. The counts above are examples only; actual values depend on the workspace being scanned.
+
+### Custom output directory
+
+For a normal run:
 
 ```bash
 OUTPUT_DIR=/tmp/fqdn-report ./extract-vservice-fqdns.sh /opt/apps/git
@@ -108,6 +143,14 @@ eks-virtualservice-report/
 ```
 
 Dry-run mode creates equivalent temporary files only for processing and removes them automatically.
+
+| File | Purpose |
+|---|---|
+| `virtualservice_fqdns.csv` | Canonical machine-readable external FQDN inventory |
+| `virtualservice_fqdns.txt` | Human-readable inventory and summary |
+| `virtualservice_fqdns_confluence.md` | Confluence-ready Markdown report |
+| `virtualservice_issues.csv` | Static validation findings |
+| `duplicate_fqdns.txt` | External FQDNs discovered more than once |
 
 ## Environment detection
 
@@ -276,6 +319,7 @@ The main table includes Environment, Project, Namespace, VirtualService, Externa
 - Kubernetes Secrets are not queried or output.
 - Dry-run mode does not populate the configured report output directory.
 - Kubernetes manifests are read only; the script does not modify application repositories.
+- Dry-run temporary reports are automatically deleted when the script exits.
 - Do not store TLS private keys or credentials in generated reports.
 - DNS resolution, TLS certificate validation, and live Service/workload validation are outside the current static-analysis scope.
 - Generated reports are ignored by Git by default.
