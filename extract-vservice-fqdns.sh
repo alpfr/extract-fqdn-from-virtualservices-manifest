@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SEARCH_ROOT="${1:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-./eks-virtualservice-report}"
-CSV_FILE="${OUTPUT_DIR}/virtualservice_fqdns.csv"
-TEXT_FILE="${OUTPUT_DIR}/virtualservice_fqdns.txt"
-CONFLUENCE_FILE="${OUTPUT_DIR}/virtualservice_fqdns_confluence.md"
-ISSUES_FILE="${OUTPUT_DIR}/virtualservice_issues.csv"
-DUP_FILE="${OUTPUT_DIR}/duplicate_fqdns.txt"
+DRY_RUN=false
+SEARCH_ROOT=""
+REQUESTED_OUTPUT_DIR="${OUTPUT_DIR:-./eks-virtualservice-report}"
+TEMP_OUTPUT_DIR=""
 
 usage() {
   cat <<USAGE
-Usage: $0 /path/to/git/workspace
+Usage:
+  $0 [--dry-run|-n] /path/to/git/workspace
+
+Options:
+  -n, --dry-run   Scan and validate without persisting report files.
+                  Reports are generated in a temporary directory,
+                  the text report is printed to stdout, and the
+                  temporary files are removed automatically.
+  -h, --help      Show this help message.
 
 Environment variables:
-  OUTPUT_DIR   Output directory (default: ./eks-virtualservice-report)
+  OUTPUT_DIR      Output directory for a normal run
+                  (default: ./eks-virtualservice-report)
 
 Requirements:
   bash 4+
@@ -22,10 +28,51 @@ Requirements:
   python3
   Python PyYAML module
 
-Example:
+Examples:
   $0 /opt/apps/git
+  $0 --dry-run /opt/apps/git
+  $0 -n /opt/apps/git
 USAGE
 }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      if [[ $# -gt 0 && -z "$SEARCH_ROOT" ]]; then
+        SEARCH_ROOT="$1"
+        shift
+      fi
+      if [[ $# -gt 0 ]]; then
+        echo "ERROR: Unexpected argument: $1" >&2
+        usage >&2
+        exit 1
+      fi
+      ;;
+    -*)
+      echo "ERROR: Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$SEARCH_ROOT" ]]; then
+        echo "ERROR: Only one Git/VS Code workspace path may be specified." >&2
+        usage >&2
+        exit 1
+      fi
+      SEARCH_ROOT="$1"
+      shift
+      ;;
+  esac
+done
 
 [[ -n "$SEARCH_ROOT" ]] || { usage; exit 1; }
 [[ -d "$SEARCH_ROOT" ]] || { echo "ERROR: Directory does not exist: $SEARCH_ROOT" >&2; exit 1; }
@@ -38,7 +85,23 @@ python3 -c 'import yaml' >/dev/null 2>&1 || {
 }
 
 SEARCH_ROOT="$(cd "$SEARCH_ROOT" && pwd)"
+
+if [[ "$DRY_RUN" == true ]]; then
+  command -v mktemp >/dev/null 2>&1 || { echo "ERROR: mktemp is required for --dry-run." >&2; exit 1; }
+  TEMP_OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/eks-vservice-fqdn-dryrun.XXXXXX")"
+  trap 'rm -rf "$TEMP_OUTPUT_DIR"' EXIT INT TERM
+  OUTPUT_DIR="$TEMP_OUTPUT_DIR"
+else
+  OUTPUT_DIR="$REQUESTED_OUTPUT_DIR"
+fi
+
 mkdir -p "$OUTPUT_DIR"
+
+CSV_FILE="${OUTPUT_DIR}/virtualservice_fqdns.csv"
+TEXT_FILE="${OUTPUT_DIR}/virtualservice_fqdns.txt"
+CONFLUENCE_FILE="${OUTPUT_DIR}/virtualservice_fqdns_confluence.md"
+ISSUES_FILE="${OUTPUT_DIR}/virtualservice_issues.csv"
+DUP_FILE="${OUTPUT_DIR}/duplicate_fqdns.txt"
 
 printf '"Environment","Project","Namespace","VirtualService","Gateway","MeshRouting","FQDN","DestinationService","DestinationPort","URIPrefix","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
 printf '"Environment","Project","Namespace","VirtualService","FQDN","Issue","Manifest"\n' > "$ISSUES_FILE"
@@ -48,6 +111,7 @@ EKS ISTIO VIRTUALSERVICE - EXTERNAL FQDN & ROUTING INVENTORY
 ===========================================================
 Generated: $(date '+%Y-%m-%d %H:%M:%S')
 Search Root: ${SEARCH_ROOT}
+Mode: $([[ "$DRY_RUN" == true ]] && printf 'DRY-RUN' || printf 'NORMAL')
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
 The special Istio gateway value "mesh" is reported as Mesh Routing = Yes and skipped during Gateway resource validation.
@@ -672,7 +736,11 @@ PY
 
 echo
 echo "============================================================"
-echo "VirtualService FQDN inventory completed"
+if [[ "$DRY_RUN" == true ]]; then
+  echo "VirtualService FQDN inventory dry-run completed"
+else
+  echo "VirtualService FQDN inventory completed"
+fi
 echo "============================================================"
 echo "Search root:              $SEARCH_ROOT"
 echo "YAML files scanned:       $FILES_SCANNED"
@@ -681,9 +749,22 @@ echo "Unique external FQDNs:    $TOTAL_FQDNS"
 echo "Validation issues:        $TOTAL_ISSUES"
 echo "Duplicate FQDNs:          $DUP_COUNT"
 echo "Internal hosts excluded:  $INTERNAL_HOSTS_EXCLUDED"
-echo
-echo "CSV report:               $CSV_FILE"
-echo "Text report:              $TEXT_FILE"
-echo "Issues report:            $ISSUES_FILE"
-echo "Duplicate FQDN list:      $DUP_FILE"
-echo "Confluence report:        $CONFLUENCE_FILE"
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo
+  echo "DRY-RUN: No report files were written to:"
+  echo "  $REQUESTED_OUTPUT_DIR"
+  echo
+  echo "The temporary reports will be removed automatically."
+  echo
+  echo "==================== DRY-RUN REPORT PREVIEW ===================="
+  cat "$TEXT_FILE"
+  echo "================== END DRY-RUN REPORT PREVIEW =================="
+else
+  echo
+  echo "CSV report:               $CSV_FILE"
+  echo "Text report:              $TEXT_FILE"
+  echo "Issues report:            $ISSUES_FILE"
+  echo "Duplicate FQDN list:      $DUP_FILE"
+  echo "Confluence report:        $CONFLUENCE_FILE"
+fi
