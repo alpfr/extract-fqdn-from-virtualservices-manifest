@@ -23,6 +23,7 @@ This version does **not** use `yq`. YAML parsing is performed with Python 3 and 
 - Performs static VirtualService-to-Gateway hostname validation against Gateway manifests in the same Git repository.
 - Detects duplicate FQDNs.
 - Generates a human-readable `.txt` report and a structured Confluence-ready `.md` page.
+- Supports `--dry-run` / `-n` for scanning and validation without persisting report files.
 
 ## Requirements
 
@@ -60,13 +61,42 @@ Example:
 ./extract-vservice-fqdns.sh /opt/apps/git
 ```
 
-Custom output directory:
+### Dry-run
+
+Use `--dry-run` or `-n` to execute the same manifest discovery, extraction, environment detection, duplicate detection, and static validation without leaving generated report files behind:
+
+```bash
+./extract-vservice-fqdns.sh --dry-run /opt/apps/git
+```
+
+or:
+
+```bash
+./extract-vservice-fqdns.sh -n /opt/apps/git
+```
+
+Dry-run mode:
+
+- scans the same workspace as a normal run;
+- performs the same VirtualService and Gateway validation;
+- generates reports only inside a temporary directory;
+- prints the summary and human-readable inventory to the terminal;
+- does not modify the configured `OUTPUT_DIR`;
+- automatically removes the temporary reports when the script exits.
+
+This makes dry-run useful for validating the search root and reviewing discovered FQDNs before creating the final inventory.
+
+Custom output directory for a normal run:
 
 ```bash
 OUTPUT_DIR=/tmp/fqdn-report ./extract-vservice-fqdns.sh /opt/apps/git
 ```
 
+`OUTPUT_DIR` is intentionally not populated during dry-run mode.
+
 ## Generated files
+
+A normal run generates:
 
 ```text
 eks-virtualservice-report/
@@ -76,6 +106,8 @@ eks-virtualservice-report/
 ├── virtualservice_issues.csv
 └── duplicate_fqdns.txt
 ```
+
+Dry-run mode creates equivalent temporary files only for processing and removes them automatically.
 
 ## Environment detection
 
@@ -229,17 +261,21 @@ The main table includes Environment, Project, Namespace, VirtualService, Externa
 ## Recommended workflow
 
 1. Identify the parent directory containing the Git repositories used by VS Code.
-2. Run the script against the workspace root.
-3. Review `virtualservice_fqdns.txt` for a readable inventory.
-4. Review `virtualservice_fqdns.csv` for the canonical machine-readable inventory.
-5. Review `virtualservice_issues.csv` and `duplicate_fqdns.txt` for findings.
-6. Copy/import `virtualservice_fqdns_confluence.md` into Confluence.
-7. Investigate validation findings before treating the inventory as authoritative.
+2. Run `./extract-vservice-fqdns.sh --dry-run /path/to/workspace` first.
+3. Review the terminal preview and validation summary.
+4. Run the script normally to generate persistent reports.
+5. Review `virtualservice_fqdns.txt` for a readable inventory.
+6. Review `virtualservice_fqdns.csv` for the canonical machine-readable inventory.
+7. Review `virtualservice_issues.csv` and `duplicate_fqdns.txt` for findings.
+8. Copy/import `virtualservice_fqdns_confluence.md` into Confluence.
+9. Investigate validation findings before treating the inventory as authoritative.
 
 ## Security and operational notes
 
 - No EKS/Kubernetes cluster access is required.
 - Kubernetes Secrets are not queried or output.
+- Dry-run mode does not populate the configured report output directory.
+- Kubernetes manifests are read only; the script does not modify application repositories.
 - Do not store TLS private keys or credentials in generated reports.
 - DNS resolution, TLS certificate validation, and live Service/workload validation are outside the current static-analysis scope.
 - Generated reports are ignored by Git by default.
