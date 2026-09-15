@@ -1,36 +1,26 @@
 # Extract FQDNs from Istio VirtualService Manifests
 
-Recursively scans a local Git/VS Code workspace for Istio `VirtualService` YAML manifests and builds an external FQDN and routing inventory in CSV, plain-text, and Confluence-ready Markdown formats.
-
-## No `yq` requirement
-
-This version does **not** use `yq`. YAML parsing is performed with Python 3 and `PyYAML`, including support for multi-document Kubernetes YAML.
+Recursively scans a local Git/VS Code workspace for Istio `VirtualService` manifests and creates a simplified inventory of externally exposed application URLs.
 
 ## What it does
 
-- Searches all `*.yaml` and `*.yml` files below a workspace root.
+- Searches `*.yaml` and `*.yml` files below a workspace root.
 - Extracts `spec.hosts[]` from Istio `VirtualService` resources.
 - Excludes Kubernetes internal hosts ending in `.svc.cluster.local`.
-- Detects `DEV`, `TEST`, `QA`, `UAT`, `STAGE`, `SHADOW`, and `PROD`.
-- Prioritizes the final namespace suffix for environment detection.
-- Falls back to the external FQDN and then manifest path when the namespace does not identify an environment.
-- Captures project, namespace, VirtualService, external Gateway, mesh-routing indicator, owner/team, Git branch, Git remote, and manifest path.
-- Captures HTTP route destination service, destination port, and URI prefix.
-- Treats Istio's special `mesh` gateway correctly: it is reported separately as Mesh Routing and skipped during Gateway resource lookup.
-- Reports a missing manifest namespace as `UNKNOWN` rather than assuming `default`.
-- Flags wildcard and malformed hostnames.
-- Flags VirtualServices without an explicit Gateway or mesh routing.
-- Performs static VirtualService-to-Gateway hostname validation against Gateway manifests in the same Git repository.
-- Detects duplicate FQDNs.
-- Generates a human-readable `.txt` report and a structured Confluence-ready `.md` page.
-- Supports `--dry-run` / `-n` for scanning and validation without persisting report files.
+- Adds `https://` before every external hostname in the report.
+- Detects environment from namespace suffix first, then FQDN, then manifest path.
+- Reports project, namespace, VirtualService, HTTPS URL, destination port, Git remote, and manifest path.
+- Detects malformed/wildcard hostnames and duplicate external URLs.
+- Uses Gateway information internally for static validation without displaying Gateway details in the primary inventory.
+- Supports `--dry-run` / `-n`.
+- Does not require `yq`.
 
 ## Requirements
 
 - Bash 4+
 - Git
 - Python 3
-- Python `PyYAML` module
+- Python `PyYAML`
 
 Verify:
 
@@ -40,23 +30,31 @@ python3 --version
 python3 -c 'import yaml; print(yaml.__version__)'
 ```
 
-If permitted:
+If permitted, install PyYAML with:
 
 ```bash
 python3 -m pip install --user pyyaml
 ```
 
-If package installation is restricted, use an approved Python environment containing PyYAML or the platform-provided `python3-pyyaml` package.
-
 ## Usage
-
-Make the script executable:
 
 ```bash
 chmod +x extract-vservice-fqdns.sh
 ```
 
-Normal scan:
+Run a dry-run first:
+
+```bash
+./extract-vservice-fqdns.sh --dry-run /path/to/git/workspace
+```
+
+Short form:
+
+```bash
+./extract-vservice-fqdns.sh -n /path/to/git/workspace
+```
+
+Normal run:
 
 ```bash
 ./extract-vservice-fqdns.sh /path/to/git/workspace
@@ -65,69 +63,21 @@ Normal scan:
 Example:
 
 ```bash
+./extract-vservice-fqdns.sh --dry-run /opt/apps/git
 ./extract-vservice-fqdns.sh /opt/apps/git
 ```
 
-Show command help:
-
-```bash
-./extract-vservice-fqdns.sh --help
-```
-
-### Dry-run
-
-Use `--dry-run` or `-n` to execute the same manifest discovery, extraction, environment detection, duplicate detection, and static validation without leaving generated report files behind:
-
-```bash
-./extract-vservice-fqdns.sh --dry-run /opt/apps/git
-```
-
-or:
-
-```bash
-./extract-vservice-fqdns.sh -n /opt/apps/git
-```
-
-Dry-run mode:
-
-- scans the same workspace as a normal run;
-- performs the same VirtualService and Gateway validation;
-- generates reports only inside a temporary directory;
-- prints the summary and human-readable inventory to the terminal;
-- does not modify the configured `OUTPUT_DIR`;
-- automatically removes the temporary reports when the script exits.
-
-This makes dry-run useful for validating the search root and reviewing discovered FQDNs before creating the final inventory.
-
-A successful dry-run ends with output similar to:
-
-```text
-============================================================
-VirtualService FQDN inventory dry-run completed
-============================================================
-Search root:              /opt/apps/git
-YAML files scanned:       125
-Projects:                 14
-Unique external FQDNs:    32
-Validation issues:        3
-Duplicate FQDNs:          1
-Internal hosts excluded:  28
-
-DRY-RUN: No report files were written to:
-  ./eks-virtualservice-report
-```
-
-The script then displays the detailed text inventory under `DRY-RUN REPORT PREVIEW`. The counts above are examples only; actual values depend on the workspace being scanned.
-
-### Custom output directory
-
-For a normal run:
+Custom output directory for a normal run:
 
 ```bash
 OUTPUT_DIR=/tmp/fqdn-report ./extract-vservice-fqdns.sh /opt/apps/git
 ```
 
-`OUTPUT_DIR` is intentionally not populated during dry-run mode.
+## Dry-run behavior
+
+Dry-run performs the same manifest discovery and validation as a normal run, but report files are created only in a temporary directory. The text inventory and summary are displayed in the terminal, and the temporary files are automatically removed when the script exits.
+
+The configured `OUTPUT_DIR` is not populated during dry-run.
 
 ## Generated files
 
@@ -142,15 +92,68 @@ eks-virtualservice-report/
 └── duplicate_fqdns.txt
 ```
 
-Dry-run mode creates equivalent temporary files only for processing and removes them automatically.
-
 | File | Purpose |
 |---|---|
-| `virtualservice_fqdns.csv` | Canonical machine-readable external FQDN inventory |
+| `virtualservice_fqdns.csv` | Canonical external HTTPS URL inventory |
 | `virtualservice_fqdns.txt` | Human-readable inventory and summary |
 | `virtualservice_fqdns_confluence.md` | Confluence-ready Markdown report |
 | `virtualservice_issues.csv` | Static validation findings |
-| `duplicate_fqdns.txt` | External FQDNs discovered more than once |
+| `duplicate_fqdns.txt` | External HTTPS URLs discovered more than once |
+
+## Primary inventory fields
+
+The primary CSV, text, and Confluence inventory contains only:
+
+| Field | Description |
+|---|---|
+| Environment | Environment detected from namespace/FQDN/path |
+| Project | Git repository/project name |
+| Namespace | Manifest namespace, or `UNKNOWN` if absent |
+| VirtualService | Istio VirtualService name |
+| HTTPS URL | External VirtualService host with `https://` prefix |
+| Destination Port | HTTP route destination port |
+| Git Remote | Git origin URL |
+| Manifest | Manifest path relative to the workspace root |
+
+The following fields have intentionally been removed from the primary report:
+
+```text
+Gateway
+Mesh Routing
+Git Branch
+URI Prefix
+Destination Service
+Owner
+Status
+```
+
+Gateway information may still be used internally by the scanner to identify validation issues, but it is not included in the primary inventory.
+
+## HTTPS URL formatting
+
+Given this VirtualService host:
+
+```yaml
+spec:
+  hosts:
+    - elasticsearch-cronjob-build-deploy.shadow.mesh.abc.mod.com
+```
+
+the report displays:
+
+```text
+https://elasticsearch-cronjob-build-deploy.shadow.mesh.abc.mod.com
+```
+
+The `https://` prefix is added for reporting convenience. The script does not perform a live TLS or HTTP connectivity test, so the prefix should not be interpreted as proof that the endpoint currently serves HTTPS.
+
+Internal Kubernetes hosts remain excluded. For example:
+
+```text
+elasticsearch-cronjob-build-deploy-pipeline.svc.cluster.local
+```
+
+is not written to the primary report.
 
 ## Environment detection
 
@@ -162,8 +165,6 @@ Environment detection uses this priority:
 3. Manifest path
 4. UNKNOWN
 ```
-
-The standard namespace convention is `<application-or-team>-<environment>`. The final hyphen-delimited token is treated as the environment when it matches a supported value.
 
 Examples:
 
@@ -177,7 +178,7 @@ Examples:
 | `aadt-app-stage` | `STAGE` |
 | `aadt-app-test` | `TEST` |
 
-Supported values are:
+Supported values:
 
 ```text
 DEV
@@ -190,136 +191,79 @@ PROD
 UNKNOWN
 ```
 
-Using the namespace suffix first prevents an unrelated environment word elsewhere in the repository path or hostname from overriding the explicitly named namespace environment.
-
-If the namespace is `UNKNOWN` or does not end in a recognized environment suffix, the script checks the external FQDN. The manifest path is used only as the final environment fallback.
-
-## Main inventory fields
-
-| Field | Description |
-|---|---|
-| Environment | Environment determined using namespace suffix first, then FQDN/path fallback |
-| Project | Git repository/project name |
-| Namespace | Manifest namespace, or `UNKNOWN` when not explicitly declared |
-| VirtualService | Istio VirtualService name |
-| Gateway | Non-`mesh` Gateway references from `spec.gateways` |
-| Mesh Routing | `Yes` when `mesh` is present in `spec.gateways`; otherwise `No` |
-| FQDN | External/application hostname |
-| Destination Service | HTTP route destination host/service |
-| Destination Port | HTTP route destination port |
-| URI Prefix | URI prefix from HTTP match rules |
-| Owner | Owner/team label when available |
-| Status | Static validation result |
-| Git Branch | Current local repository branch |
-| Git Remote | Git origin URL |
-| Manifest | Manifest path relative to workspace root |
-
-## VirtualService example
-
-```yaml
-apiVersion: networking.istio.io/v1
-kind: VirtualService
-metadata:
-  name: elasticsearch-cronjob-build-deploy-pipeline-vservice
-  namespace: aadt-exec-shadow
-spec:
-  hosts:
-    - elasticsearch-cronjob-build-deploy.shadow.mesh.abc.mod.com
-    - elasticsearch-cronjob-build-deploy-pipeline.svc.cluster.local
-  gateways:
-    - mesh
-    - istio-ingress/default-gateway
-  http:
-    - match:
-        - uri:
-            prefix: "/"
-      route:
-        - destination:
-            host: elasticsearch-cronjob-build-deploy-pipeline-service
-            port:
-              number: 443
-```
-
-The report includes the external host and reports:
+## Example report record
 
 ```text
-Environment : SHADOW
-Namespace   : aadt-exec-shadow
+Environment      : SHADOW
+Project          : elasticsearch-cronjob-build-deploy
+Namespace        : aadt-exec-shadow
+VirtualService   : elasticsearch-cronjob-build-deploy-pipeline-vservice
+HTTPS URL        : https://elasticsearch-cronjob-build-deploy.shadow.mesh.abc.mod.com
+Destination Port : 443
+Git Remote       : git@github.com:example/elasticsearch-cronjob-build-deploy.git
+Manifest         : elasticsearch-cronjob-build-deploy/k8s/virtualservice.yaml
 ```
 
-The `.svc.cluster.local` hostname is excluded.
+## Missing namespace
 
-## Istio `mesh` gateway handling
-
-For:
-
-```yaml
-gateways:
-  - mesh
-  - istio-ingress/default-gateway
-```
-
-the reports show:
+If `metadata.namespace` is not explicitly defined, the report uses:
 
 ```text
-Gateway      : istio-ingress/default-gateway
-Mesh Routing : Yes
+UNKNOWN
 ```
 
-`mesh` is an Istio reserved value representing sidecar/mesh routing, not a Kubernetes `Gateway` resource. It is therefore not searched as a Gateway manifest.
+The namespace may be supplied later by Helm, Kustomize, Argo CD, or the deployment pipeline.
 
-## Missing namespace handling
+## Validation issues
 
-The script does not assume that a VirtualService without `metadata.namespace` belongs to `default`. It reports `UNKNOWN`, because Helm, Kustomize, Argo CD, or a deployment pipeline may supply the namespace at deployment time.
+Validation findings remain separate from the primary inventory in:
 
-## Status values
+```text
+virtualservice_issues.csv
+```
 
-| Status | Meaning |
-|---|---|
-| `VALID` | External FQDN passed basic static checks |
-| `WILDCARD` | Host is a wildcard FQDN |
-| `NONSTANDARD` | Host does not match basic FQDN syntax |
-| `MISSING_GATEWAY` | VirtualService has neither an explicit external Gateway nor mesh routing |
-| `GATEWAY_HOST_MISMATCH` | Host was not found on a referenced non-`mesh` Gateway in repository manifests |
+This keeps the main report focused on the external URL inventory while preserving useful static-analysis findings.
 
 ## Confluence page
 
-The generated page is titled:
-
-**EKS Istio VirtualService – External FQDN & Routing Inventory**
-
-and contains:
+The generated Confluence-ready page contains:
 
 1. Overview
 2. Summary
-3. External FQDN & Routing Inventory
+3. External FQDN Inventory
 4. Validation Issues
-5. Duplicate FQDNs
+5. Duplicate URLs
 6. Validation Rules
-7. Status Definitions
-8. Important Notes
+7. Important Notes
 
-The main table includes Environment, Project, Namespace, VirtualService, External FQDN, Gateway, Mesh Routing, Destination Service, Port, URI, and Status.
+The main Confluence table contains:
+
+```text
+Environment
+Project
+Namespace
+VirtualService
+HTTPS URL
+Destination Port
+Git Remote
+Manifest
+```
 
 ## Recommended workflow
 
 1. Identify the parent directory containing the Git repositories used by VS Code.
-2. Run `./extract-vservice-fqdns.sh --dry-run /path/to/workspace` first.
-3. Review the terminal preview and validation summary.
-4. Run the script normally to generate persistent reports.
-5. Review `virtualservice_fqdns.txt` for a readable inventory.
-6. Review `virtualservice_fqdns.csv` for the canonical machine-readable inventory.
-7. Review `virtualservice_issues.csv` and `duplicate_fqdns.txt` for findings.
-8. Copy/import `virtualservice_fqdns_confluence.md` into Confluence.
-9. Investigate validation findings before treating the inventory as authoritative.
+2. Run the script with `--dry-run` first.
+3. Review the terminal inventory and summary.
+4. Run normally to create persistent reports.
+5. Review `virtualservice_fqdns.csv` as the canonical inventory.
+6. Review `virtualservice_issues.csv` and `duplicate_fqdns.txt` separately.
+7. Copy/import `virtualservice_fqdns_confluence.md` into Confluence.
 
 ## Security and operational notes
 
 - No EKS/Kubernetes cluster access is required.
 - Kubernetes Secrets are not queried or output.
-- Dry-run mode does not populate the configured report output directory.
-- Kubernetes manifests are read only; the script does not modify application repositories.
-- Dry-run temporary reports are automatically deleted when the script exits.
-- Do not store TLS private keys or credentials in generated reports.
-- DNS resolution, TLS certificate validation, and live Service/workload validation are outside the current static-analysis scope.
+- Source manifests are read only.
+- Dry-run does not populate the configured output directory.
 - Generated reports are ignored by Git by default.
+- The script does not verify live DNS, TLS certificates, load balancers, Services, workloads, or application availability.
