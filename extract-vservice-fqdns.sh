@@ -97,6 +97,7 @@ Mode: $([[ "$DRY_RUN" == true ]] && printf 'DRY-RUN' || printf 'NORMAL')
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
 External hosts are rendered as HTTPS URLs.
+Namespace is read from the project's config.json first, then VirtualService metadata.namespace as a fallback.
 Environment detection prioritizes namespace suffix, then FQDN, then manifest path.
 
 FQDN INVENTORY
@@ -137,6 +138,99 @@ get_git_remote() {
     git -C "$repo" config --get remote.origin.url 2>/dev/null || printf '%s' '-'
   else
     printf '%s' '-'
+  fi
+}
+
+extract_namespace_from_config() {
+  local config_file="$1"
+
+  python3 - "$config_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8') as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+
+preferred_paths = [
+    ('namespace',),
+    ('kubernetes', 'namespace'),
+    ('eks', 'namespace'),
+    ('deployment', 'namespace'),
+    ('metadata', 'namespace'),
+    ('config', 'namespace'),
+]
+
+def get_path(obj, parts):
+    cur = obj
+    for part in parts:
+        if not isinstance(cur, dict):
+            return None
+        match = next((k for k in cur if str(k).lower() == part.lower()), None)
+        if match is None:
+            return None
+        cur = cur[match]
+    return cur
+
+for parts in preferred_paths:
+    value = get_path(data, parts)
+    if isinstance(value, (str, int, float)) and str(value).strip():
+        print(str(value).strip())
+        sys.exit(0)
+
+# Fallback: recursively locate the first scalar key named "namespace".
+def find_namespace(obj):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if str(key).lower() == 'namespace' and isinstance(value, (str, int, float)):
+                text = str(value).strip()
+                if text:
+                    return text
+        for value in obj.values():
+            found = find_namespace(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_namespace(value)
+            if found:
+                return found
+    return None
+
+value = find_namespace(data)
+if value:
+    print(value)
+PY
+}
+
+get_config_namespace() {
+  local file="$1" repo dir config_file
+
+  repo="$(get_repo_root "$file" 2>/dev/null || true)"
+  [[ -n "$repo" ]] || return 0
+
+  # Prefer a config.json closest to the manifest by walking upward
+  # from the manifest directory to the Git repository root.
+  dir="$(dirname "$file")"
+  while true; do
+    if [[ -f "$dir/config.json" ]]; then
+      extract_namespace_from_config "$dir/config.json"
+      return 0
+    fi
+    [[ "$dir" == "$repo" || "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+
+  # Fallback for repositories where config.json is stored elsewhere.
+  config_file="$(find "$repo" \
+    \( -type d \( -name .git -o -name node_modules -o -name vendor -o -name .terraform -o -name dist -o -name build \) -prune \) -o \
+    \( -type f -name 'config.json' -print \) 2>/dev/null | head -n 1)"
+
+  if [[ -n "$config_file" ]]; then
+    extract_namespace_from_config "$config_file"
   fi
 }
 
@@ -223,7 +317,7 @@ for doc in docs:
 
     meta = doc.get('metadata') or {}
     spec = doc.get('spec') or {}
-    namespace = meta.get('namespace') or 'UNKNOWN'
+    manifest_namespace = meta.get('namespace') or 'UNKNOWN'
     name = meta.get('name') or 'unknown'
 
     raw_gateways = spec.get('gateways') or []
@@ -255,7 +349,7 @@ for doc in docs:
     for host in hosts:
         if host is None:
             continue
-        values = [namespace, name, gateway_text, mesh_routing, clean(host), port_text]
+        values = [manifest_namespace, name, gateway_text, mesh_routing, clean(host), port_text]
         print('\t'.join(clean(v) for v in values))
 PY
 }
@@ -326,11 +420,17 @@ while IFS= read -r -d '' FILE; do
   PROJECT="$(get_project_name "$FILE")"
   REMOTE="$(get_git_remote "$FILE")"
   RELATIVE_FILE="${FILE#${SEARCH_ROOT}/}"
+  CONFIG_NAMESPACE="$(get_config_namespace "$FILE" 2>/dev/null || true)"
 
-  while IFS=$'\t' read -r NAMESPACE VS_NAME GATEWAY MESH_ROUTING HOST DEST_PORT; do
+  while IFS=$'\t' read -r MANIFEST_NAMESPACE VS_NAME GATEWAY MESH_ROUTING HOST DEST_PORT; do
     [[ -n "$HOST" ]] || continue
 
-    NAMESPACE="${NAMESPACE:-UNKNOWN}"
+    if [[ -n "$CONFIG_NAMESPACE" ]]; then
+      NAMESPACE="$CONFIG_NAMESPACE"
+    else
+      NAMESPACE="${MANIFEST_NAMESPACE:-UNKNOWN}"
+    fi
+
     VS_NAME="${VS_NAME:-unknown}"
     GATEWAY="${GATEWAY:--}"
     MESH_ROUTING="${MESH_ROUTING:-No}"
@@ -501,10 +601,11 @@ with open(output_file, 'w', encoding='utf-8') as out:
 
     out.write('## Overview\n\n')
     out.write('This page provides an inventory of external HTTPS URLs configured from Istio VirtualService hosts across application Git repositories.\n\n')
-    out.write('Kubernetes internal hosts ending in `.svc.cluster.local` are excluded.\n\n')
+    out.write('Kubernetes internal hosts ending in `.svc.cluster.local` are excluded. Namespace values are sourced from each project\'s `config.json` when available.\n\n')
     out.write(f'**Last Generated:** {now}  \n')
     out.write(f'**Source:** Git repositories under `{search_root}`  \n')
     out.write('**Resource:** Istio VirtualService  \n')
+    out.write('**Namespace Source:** `config.json` first, `metadata.namespace` fallback  \n')
     out.write('**Internal Hosts:** Excluded  \n')
     out.write('**URL Scheme:** HTTPS\n\n')
     out.write('---\n\n')
@@ -552,6 +653,7 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('## Validation Rules\n\n')
     out.write('- Excludes `*.svc.cluster.local`.\n')
     out.write('- Adds the `https://` prefix to each reported external host.\n')
+    out.write('- Reads namespace from the project `config.json` first and falls back to VirtualService `metadata.namespace`.\n')
     out.write('- Determines environment primarily from the namespace suffix, then FQDN, then manifest path.\n')
     out.write('- Detects malformed and wildcard hostnames.\n')
     out.write('- Uses Gateway data internally for static validation but does not display Gateway details in the primary report.\n')
@@ -559,8 +661,9 @@ with open(output_file, 'w', encoding='utf-8') as out:
     out.write('---\n\n')
 
     out.write('## Important Notes\n\n')
+    out.write('The script searches for the nearest `config.json` from the VirtualService manifest up to the Git repository root. If none is found there, it searches the repository for a `config.json`.\n\n')
+    out.write('The JSON parser first checks common namespace locations and then recursively searches for a scalar key named `namespace`.\n\n')
     out.write('The `https://` prefix is added for reporting convenience. This static report does not verify that TLS is configured or that the URL is reachable.\n\n')
-    out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest.\n\n')
     out.write('This report analyzes Git manifests only and does not verify live EKS resources, DNS resolution, certificates, load balancers, or application availability.\n')
 PY
 
