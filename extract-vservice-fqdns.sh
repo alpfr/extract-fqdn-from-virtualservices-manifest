@@ -13,9 +13,6 @@ Usage:
 
 Options:
   -n, --dry-run   Scan and validate without persisting report files.
-                  Reports are generated in a temporary directory,
-                  the text report is printed to stdout, and the
-                  temporary files are removed automatically.
   -h, --help      Show this help message.
 
 Environment variables:
@@ -31,7 +28,6 @@ Requirements:
 Examples:
   $0 /opt/apps/git
   $0 --dry-run /opt/apps/git
-  $0 -n /opt/apps/git
 USAGE
 }
 
@@ -45,18 +41,6 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    --)
-      shift
-      if [[ $# -gt 0 && -z "$SEARCH_ROOT" ]]; then
-        SEARCH_ROOT="$1"
-        shift
-      fi
-      if [[ $# -gt 0 ]]; then
-        echo "ERROR: Unexpected argument: $1" >&2
-        usage >&2
-        exit 1
-      fi
-      ;;
     -*)
       echo "ERROR: Unknown option: $1" >&2
       usage >&2
@@ -64,8 +48,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       if [[ -n "$SEARCH_ROOT" ]]; then
-        echo "ERROR: Only one Git/VS Code workspace path may be specified." >&2
-        usage >&2
+        echo "ERROR: Only one workspace path may be specified." >&2
         exit 1
       fi
       SEARCH_ROOT="$1"
@@ -87,7 +70,6 @@ python3 -c 'import yaml' >/dev/null 2>&1 || {
 SEARCH_ROOT="$(cd "$SEARCH_ROOT" && pwd)"
 
 if [[ "$DRY_RUN" == true ]]; then
-  command -v mktemp >/dev/null 2>&1 || { echo "ERROR: mktemp is required for --dry-run." >&2; exit 1; }
   TEMP_OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/eks-vservice-fqdn-dryrun.XXXXXX")"
   trap 'rm -rf "$TEMP_OUTPUT_DIR"' EXIT INT TERM
   OUTPUT_DIR="$TEMP_OUTPUT_DIR"
@@ -103,19 +85,19 @@ CONFLUENCE_FILE="${OUTPUT_DIR}/virtualservice_fqdns_confluence.md"
 ISSUES_FILE="${OUTPUT_DIR}/virtualservice_issues.csv"
 DUP_FILE="${OUTPUT_DIR}/duplicate_fqdns.txt"
 
-printf '"Environment","Project","Namespace","VirtualService","Gateway","MeshRouting","FQDN","DestinationService","DestinationPort","URIPrefix","Owner","Status","GitBranch","GitRemote","Manifest"\n' > "$CSV_FILE"
-printf '"Environment","Project","Namespace","VirtualService","FQDN","Issue","Manifest"\n' > "$ISSUES_FILE"
+printf '"Environment","Project","Namespace","VirtualService","HTTPS_URL","DestinationPort","GitRemote","Manifest"\n' > "$CSV_FILE"
+printf '"Environment","Project","Namespace","VirtualService","HTTPS_URL","Issue","Manifest"\n' > "$ISSUES_FILE"
 
 cat > "$TEXT_FILE" <<EOF2
-EKS ISTIO VIRTUALSERVICE - EXTERNAL FQDN & ROUTING INVENTORY
-===========================================================
+EKS ISTIO VIRTUALSERVICE - EXTERNAL FQDN INVENTORY
+=================================================
 Generated: $(date '+%Y-%m-%d %H:%M:%S')
 Search Root: ${SEARCH_ROOT}
 Mode: $([[ "$DRY_RUN" == true ]] && printf 'DRY-RUN' || printf 'NORMAL')
 
 Internal Kubernetes hosts ending in .svc.cluster.local are excluded.
-The special Istio gateway value "mesh" is reported as Mesh Routing = Yes and skipped during Gateway resource validation.
-Environment detection prioritizes the namespace suffix before FQDN and manifest path fallbacks.
+External hosts are rendered as HTTPS URLs.
+Environment detection prioritizes namespace suffix, then FQDN, then manifest path.
 
 FQDN INVENTORY
 --------------
@@ -128,7 +110,10 @@ get_repo_root() {
   local file="$1" dir
   dir="$(dirname "$file")"
   while [[ "$dir" != "/" ]]; do
-    if [[ -d "$dir/.git" ]]; then printf '%s\n' "$dir"; return 0; fi
+    if [[ -d "$dir/.git" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
     [[ "$dir" == "$SEARCH_ROOT" ]] && break
     dir="$(dirname "$dir")"
   done
@@ -142,16 +127,6 @@ get_project_name() {
   else
     rel="${file#${SEARCH_ROOT}/}"
     printf '%s\n' "${rel%%/*}"
-  fi
-}
-
-get_git_branch() {
-  local file="$1" repo branch
-  repo="$(get_repo_root "$file" 2>/dev/null || true)"
-  if [[ -n "$repo" ]] && branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"; then
-    printf '%s' "$branch"
-  else
-    printf '%s' '-'
   fi
 }
 
@@ -170,48 +145,36 @@ detect_environment() {
   local ns_lower host_lower file_lower
 
   ns_lower="$(printf '%s' "$namespace" | tr '[:upper:]' '[:lower:]')"
-
-  # Primary rule: environment is the final hyphen-delimited namespace token.
-  # Examples:
-  #   aadt-ddx-ddd-prod   -> PROD
-  #   aadt-exec-dev       -> DEV
-  #   aadt-exec-shadow    -> SHADOW
   case "$ns_lower" in
-    *-prod|*-production)    printf '%s' 'PROD'; return ;;
-    *-shadow)               printf '%s' 'SHADOW'; return ;;
-    *-uat)                  printf '%s' 'UAT'; return ;;
-    *-stage|*-staging)      printf '%s' 'STAGE'; return ;;
-    *-qa)                   printf '%s' 'QA'; return ;;
-    *-test|*-tst)           printf '%s' 'TEST'; return ;;
-    *-dev|*-development)    printf '%s' 'DEV'; return ;;
+    *-prod|*-production) printf '%s' 'PROD'; return ;;
+    *-shadow)            printf '%s' 'SHADOW'; return ;;
+    *-uat)               printf '%s' 'UAT'; return ;;
+    *-stage|*-staging)   printf '%s' 'STAGE'; return ;;
+    *-qa)                printf '%s' 'QA'; return ;;
+    *-test|*-tst)        printf '%s' 'TEST'; return ;;
+    *-dev|*-development) printf '%s' 'DEV'; return ;;
   esac
 
-  # Secondary rule: infer from the external/application FQDN.
   host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
   case "$host_lower" in
-    *.prod.*|*.production.*|*-prod.*)       printf '%s' 'PROD'; return ;;
-    *.shadow.*|*-shadow.*)                  printf '%s' 'SHADOW'; return ;;
-    *.uat.*|*-uat.*)                        printf '%s' 'UAT'; return ;;
-    *.stage.*|*.staging.*|*-stage.*|*-staging.*)
-                                             printf '%s' 'STAGE'; return ;;
-    *.qa.*|*-qa.*)                          printf '%s' 'QA'; return ;;
-    *.test.*|*.tst.*|*-test.*|*-tst.*)      printf '%s' 'TEST'; return ;;
-    *.dev.*|*.development.*|*-dev.*|*-development.*)
-                                             printf '%s' 'DEV'; return ;;
+    *.prod.*|*.production.*|*-prod.*) printf '%s' 'PROD'; return ;;
+    *.shadow.*|*-shadow.*)            printf '%s' 'SHADOW'; return ;;
+    *.uat.*|*-uat.*)                  printf '%s' 'UAT'; return ;;
+    *.stage.*|*.staging.*|*-stage.*|*-staging.*) printf '%s' 'STAGE'; return ;;
+    *.qa.*|*-qa.*)                    printf '%s' 'QA'; return ;;
+    *.test.*|*.tst.*|*-test.*|*-tst.*) printf '%s' 'TEST'; return ;;
+    *.dev.*|*.development.*|*-dev.*|*-development.*) printf '%s' 'DEV'; return ;;
   esac
 
-  # Final fallback: inspect the manifest path.
   file_lower="$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')"
   case "$file_lower" in
-    */prod/*|*/production/*|*-prod/*)        printf '%s' 'PROD'; return ;;
-    */shadow/*|*-shadow/*)                   printf '%s' 'SHADOW'; return ;;
-    */uat/*|*-uat/*)                         printf '%s' 'UAT'; return ;;
-    */stage/*|*/staging/*|*-stage/*|*-staging/*)
-                                             printf '%s' 'STAGE'; return ;;
-    */qa/*|*-qa/*)                           printf '%s' 'QA'; return ;;
-    */test/*|*/tst/*|*-test/*|*-tst/*)       printf '%s' 'TEST'; return ;;
-    */dev/*|*/development/*|*-dev/*|*-development/*)
-                                             printf '%s' 'DEV'; return ;;
+    */prod/*|*/production/*|*-prod/*) printf '%s' 'PROD'; return ;;
+    */shadow/*|*-shadow/*)            printf '%s' 'SHADOW'; return ;;
+    */uat/*|*-uat/*)                  printf '%s' 'UAT'; return ;;
+    */stage/*|*/staging/*|*-stage/*|*-staging/*) printf '%s' 'STAGE'; return ;;
+    */qa/*|*-qa/*)                    printf '%s' 'QA'; return ;;
+    */test/*|*/tst/*|*-test/*|*-tst/*) printf '%s' 'TEST'; return ;;
+    */dev/*|*/development/*|*-dev/*|*-development/*) printf '%s' 'DEV'; return ;;
   esac
 
   printf '%s' 'UNKNOWN'
@@ -260,60 +223,30 @@ for doc in docs:
 
     meta = doc.get('metadata') or {}
     spec = doc.get('spec') or {}
-    labels = meta.get('labels') or {}
-
     namespace = meta.get('namespace') or 'UNKNOWN'
     name = meta.get('name') or 'unknown'
-    owner = (
-        labels.get('app.kubernetes.io/owner')
-        or labels.get('owner')
-        or labels.get('team')
-        or '-'
-    )
 
     raw_gateways = spec.get('gateways') or []
     if not isinstance(raw_gateways, list):
         raw_gateways = [raw_gateways]
     raw_gateways = unique(raw_gateways)
-
     mesh_routing = 'Yes' if 'mesh' in raw_gateways else 'No'
     external_gateways = [g for g in raw_gateways if g != 'mesh']
     gateway_text = ','.join(external_gateways) if external_gateways else '-'
 
-    destination_hosts = []
     destination_ports = []
-    uri_prefixes = []
-
     for http in spec.get('http') or []:
         if not isinstance(http, dict):
             continue
-
-        for match in http.get('match') or []:
-            if not isinstance(match, dict):
-                continue
-            uri = match.get('uri') or {}
-            if isinstance(uri, dict) and uri.get('prefix') is not None:
-                uri_prefixes.append(uri.get('prefix'))
-
         for route in http.get('route') or []:
             if not isinstance(route, dict):
                 continue
             destination = route.get('destination') or {}
-            if not isinstance(destination, dict):
-                continue
-            if destination.get('host') is not None:
-                destination_hosts.append(destination.get('host'))
             port = destination.get('port') or {}
             if isinstance(port, dict) and port.get('number') is not None:
                 destination_ports.append(port.get('number'))
 
-    destination_hosts = unique(destination_hosts)
-    destination_ports = unique(destination_ports)
-    uri_prefixes = unique(uri_prefixes)
-
-    destination_text = ','.join(destination_hosts) if destination_hosts else '-'
-    port_text = ','.join(destination_ports) if destination_ports else '-'
-    prefix_text = ','.join(uri_prefixes) if uri_prefixes else '-'
+    port_text = ','.join(unique(destination_ports)) if destination_ports else '-'
 
     hosts = spec.get('hosts') or []
     if not isinstance(hosts, list):
@@ -322,17 +255,7 @@ for doc in docs:
     for host in hosts:
         if host is None:
             continue
-        values = [
-            namespace,
-            name,
-            owner,
-            gateway_text,
-            mesh_routing,
-            clean(host),
-            destination_text,
-            port_text,
-            prefix_text,
-        ]
+        values = [namespace, name, gateway_text, mesh_routing, clean(host), port_text]
         print('\t'.join(clean(v) for v in values))
 PY
 }
@@ -357,21 +280,11 @@ root, gateway_name, gateway_ns, host = sys.argv[1:5]
 exclude_dirs = {'.git', 'node_modules', 'vendor', '.terraform', 'dist', 'build'}
 
 def host_matches(pattern, value):
-    if pattern == '*':
+    if pattern == '*' or pattern == value:
         return True
-    if pattern == value:
-        return True
-    if pattern.startswith('*.'):
-        return fnmatch.fnmatch(value, pattern)
     if '/' in pattern:
         pattern = pattern.split('/', 1)[1]
-        if pattern == '*':
-            return True
-        if pattern == value:
-            return True
-        if pattern.startswith('*.'):
-            return fnmatch.fnmatch(value, pattern)
-    return False
+    return pattern == '*' or pattern == value or (pattern.startswith('*.') and fnmatch.fnmatch(value, pattern))
 
 for current, dirs, files in os.walk(root):
     dirs[:] = [d for d in dirs if d not in exclude_dirs]
@@ -381,8 +294,7 @@ for current, dirs, files in os.walk(root):
         path = os.path.join(current, name)
         try:
             with open(path, 'r', encoding='utf-8') as fh:
-                docs = yaml.safe_load_all(fh)
-                for doc in docs:
+                for doc in yaml.safe_load_all(fh):
                     if not isinstance(doc, dict) or doc.get('kind') != 'Gateway':
                         continue
                     meta = doc.get('metadata') or {}
@@ -391,8 +303,7 @@ for current, dirs, files in os.walk(root):
                     explicit_ns = meta.get('namespace')
                     if gateway_ns and explicit_ns and explicit_ns != gateway_ns:
                         continue
-                    spec = doc.get('spec') or {}
-                    for server in spec.get('servers') or []:
+                    for server in (doc.get('spec') or {}).get('servers') or []:
                         if not isinstance(server, dict):
                             continue
                         for pattern in server.get('hosts') or []:
@@ -400,7 +311,6 @@ for current, dirs, files in os.walk(root):
                                 sys.exit(0)
         except Exception:
             continue
-
 sys.exit(1)
 PY
 }
@@ -414,21 +324,17 @@ while IFS= read -r -d '' FILE; do
   ((FILES_SCANNED+=1))
 
   PROJECT="$(get_project_name "$FILE")"
-  BRANCH="$(get_git_branch "$FILE")"
   REMOTE="$(get_git_remote "$FILE")"
   RELATIVE_FILE="${FILE#${SEARCH_ROOT}/}"
 
-  while IFS=$'\t' read -r NAMESPACE VS_NAME OWNER GATEWAY MESH_ROUTING HOST DEST_SERVICE DEST_PORT URI_PREFIX; do
+  while IFS=$'\t' read -r NAMESPACE VS_NAME GATEWAY MESH_ROUTING HOST DEST_PORT; do
     [[ -n "$HOST" ]] || continue
 
     NAMESPACE="${NAMESPACE:-UNKNOWN}"
     VS_NAME="${VS_NAME:-unknown}"
-    OWNER="${OWNER:--}"
     GATEWAY="${GATEWAY:--}"
     MESH_ROUTING="${MESH_ROUTING:-No}"
-    DEST_SERVICE="${DEST_SERVICE:--}"
     DEST_PORT="${DEST_PORT:--}"
-    URI_PREFIX="${URI_PREFIX:--}"
 
     if ! is_external_host "$HOST"; then
       ((INTERNAL_HOSTS_EXCLUDED+=1))
@@ -436,23 +342,20 @@ while IFS= read -r -d '' FILE; do
     fi
 
     ENVIRONMENT="$(detect_environment "$RELATIVE_FILE" "$NAMESPACE" "$HOST")"
-    STATUS="VALID"
+    HTTPS_URL="https://${HOST}"
     ISSUE=""
 
     if [[ "$HOST" == \*.* ]]; then
-      STATUS="WILDCARD"
       ISSUE="Wildcard hostname"
     elif ! valid_hostname "$HOST"; then
-      STATUS="NONSTANDARD"
       ISSUE="Hostname does not match expected FQDN syntax"
     fi
 
-    if [[ "$GATEWAY" == "-" ]]; then
-      if [[ "$MESH_ROUTING" != "Yes" ]]; then
-        STATUS="MISSING_GATEWAY"
-        ISSUE="VirtualService has no explicit gateway"
-      fi
-    else
+    if [[ -z "$ISSUE" && "$GATEWAY" == "-" && "$MESH_ROUTING" != "Yes" ]]; then
+      ISSUE="VirtualService has no explicit gateway"
+    fi
+
+    if [[ -z "$ISSUE" && "$GATEWAY" != "-" ]]; then
       IFS=',' read -ra GW_ARRAY <<< "$GATEWAY"
       for GW in "${GW_ARRAY[@]}"; do
         GW="${GW#${GW%%[![:space:]]*}}"
@@ -462,7 +365,6 @@ while IFS= read -r -d '' FILE; do
         rc=$?
         set -e
         if [[ $rc -eq 1 ]]; then
-          STATUS="GATEWAY_HOST_MISMATCH"
           ISSUE="Host not found on referenced Gateway in repository manifests"
           break
         fi
@@ -474,35 +376,21 @@ while IFS= read -r -d '' FILE; do
       csv_escape "$PROJECT"; printf ','
       csv_escape "$NAMESPACE"; printf ','
       csv_escape "$VS_NAME"; printf ','
-      csv_escape "$GATEWAY"; printf ','
-      csv_escape "$MESH_ROUTING"; printf ','
-      csv_escape "$HOST"; printf ','
-      csv_escape "$DEST_SERVICE"; printf ','
+      csv_escape "$HTTPS_URL"; printf ','
       csv_escape "$DEST_PORT"; printf ','
-      csv_escape "$URI_PREFIX"; printf ','
-      csv_escape "$OWNER"; printf ','
-      csv_escape "$STATUS"; printf ','
-      csv_escape "$BRANCH"; printf ','
       csv_escape "$REMOTE"; printf ','
       csv_escape "$RELATIVE_FILE"; printf '\n'
     } >> "$CSV_FILE"
 
     cat >> "$TEXT_FILE" <<EOF2
-Environment         : ${ENVIRONMENT}
-Project             : ${PROJECT}
-Namespace           : ${NAMESPACE}
-VirtualService      : ${VS_NAME}
-Gateway             : ${GATEWAY}
-Mesh Routing        : ${MESH_ROUTING}
-FQDN                : ${HOST}
-Destination Service : ${DEST_SERVICE}
-Destination Port    : ${DEST_PORT}
-URI Prefix          : ${URI_PREFIX}
-Owner               : ${OWNER}
-Status              : ${STATUS}
-Git Branch          : ${BRANCH}
-Git Remote          : ${REMOTE}
-Manifest            : ${RELATIVE_FILE}
+Environment      : ${ENVIRONMENT}
+Project          : ${PROJECT}
+Namespace        : ${NAMESPACE}
+VirtualService   : ${VS_NAME}
+HTTPS URL        : ${HTTPS_URL}
+Destination Port : ${DEST_PORT}
+Git Remote       : ${REMOTE}
+Manifest         : ${RELATIVE_FILE}
 ------------------------------------------------------------
 EOF2
 
@@ -512,7 +400,7 @@ EOF2
         csv_escape "$PROJECT"; printf ','
         csv_escape "$NAMESPACE"; printf ','
         csv_escape "$VS_NAME"; printf ','
-        csv_escape "$HOST"; printf ','
+        csv_escape "$HTTPS_URL"; printf ','
         csv_escape "$ISSUE"; printf ','
         csv_escape "$RELATIVE_FILE"; printf '\n'
       } >> "$ISSUES_FILE"
@@ -537,16 +425,16 @@ csv_file, dup_file = sys.argv[1:3]
 counts = collections.Counter()
 with open(csv_file, newline='', encoding='utf-8') as fh:
     for row in csv.DictReader(fh):
-        fqdn = (row.get('FQDN') or '').strip()
-        if fqdn:
-            counts[fqdn] += 1
+        url = (row.get('HTTPS_URL') or '').strip()
+        if url:
+            counts[url] += 1
 
 with open(dup_file, 'w', encoding='utf-8') as out:
-    for fqdn in sorted(k for k, v in counts.items() if v > 1):
-        out.write(f'{fqdn}\t{counts[fqdn]}\n')
+    for url in sorted(k for k, v in counts.items() if v > 1):
+        out.write(f'{url}\t{counts[url]}\n')
 PY
 
-read -r TOTAL_RECORDS TOTAL_ISSUES TOTAL_FQDNS TOTAL_PROJECTS < <(
+read -r TOTAL_RECORDS TOTAL_ISSUES TOTAL_URLS TOTAL_PROJECTS < <(
   python3 - "$CSV_FILE" "$ISSUES_FILE" <<'PY'
 import csv
 import sys
@@ -556,10 +444,9 @@ with open(csv_file, newline='', encoding='utf-8') as fh:
     rows = list(csv.DictReader(fh))
 with open(issues_file, newline='', encoding='utf-8') as fh:
     issues = list(csv.DictReader(fh))
-
-fqdns = {r.get('FQDN', '') for r in rows if r.get('FQDN')}
+urls = {r.get('HTTPS_URL', '') for r in rows if r.get('HTTPS_URL')}
 projects = {r.get('Project', '') for r in rows if r.get('Project')}
-print(len(rows), len(issues), len(fqdns), len(projects))
+print(len(rows), len(issues), len(urls), len(projects))
 PY
 )
 DUP_COUNT="$(wc -l < "$DUP_FILE" | tr -d ' ')"
@@ -569,33 +456,22 @@ cat >> "$TEXT_FILE" <<EOF2
 SUMMARY
 -------
 YAML Files Scanned            : ${FILES_SCANNED}
-Projects with FQDN Records    : ${TOTAL_PROJECTS}
-Unique External FQDNs         : ${TOTAL_FQDNS}
-VirtualService/FQDN Mappings  : ${TOTAL_RECORDS}
+Projects with URL Records     : ${TOTAL_PROJECTS}
+Unique External HTTPS URLs    : ${TOTAL_URLS}
+VirtualService/URL Mappings   : ${TOTAL_RECORDS}
 Validation Issues             : ${TOTAL_ISSUES}
-Duplicate FQDNs               : ${DUP_COUNT}
+Duplicate URLs                : ${DUP_COUNT}
 Internal Hosts Excluded       : ${INTERNAL_HOSTS_EXCLUDED}
 EOF2
 
-python3 - "$CSV_FILE" "$ISSUES_FILE" "$DUP_FILE" "$CONFLUENCE_FILE" "$SEARCH_ROOT" "$FILES_SCANNED" "$TOTAL_PROJECTS" "$TOTAL_FQDNS" "$TOTAL_RECORDS" "$TOTAL_ISSUES" "$DUP_COUNT" "$INTERNAL_HOSTS_EXCLUDED" <<'PY'
+python3 - "$CSV_FILE" "$ISSUES_FILE" "$DUP_FILE" "$CONFLUENCE_FILE" "$SEARCH_ROOT" "$FILES_SCANNED" "$TOTAL_PROJECTS" "$TOTAL_URLS" "$TOTAL_RECORDS" "$TOTAL_ISSUES" "$DUP_COUNT" "$INTERNAL_HOSTS_EXCLUDED" <<'PY'
 import csv
 import datetime
 import sys
 
-(
-    csv_file,
-    issues_file,
-    dup_file,
-    output_file,
-    search_root,
-    files_scanned,
-    total_projects,
-    total_fqdns,
-    total_records,
-    total_issues,
-    duplicate_count,
-    internal_excluded,
-) = sys.argv[1:]
+(csv_file, issues_file, dup_file, output_file, search_root, files_scanned,
+ total_projects, total_urls, total_records, total_issues, duplicate_count,
+ internal_excluded) = sys.argv[1:]
 
 with open(csv_file, newline='', encoding='utf-8') as fh:
     rows = list(csv.DictReader(fh))
@@ -606,132 +482,86 @@ duplicates = []
 with open(dup_file, encoding='utf-8') as fh:
     for line in fh:
         line = line.rstrip('\n')
-        if not line:
-            continue
-        parts = line.split('\t', 1)
-        duplicates.append((parts[0], parts[1] if len(parts) > 1 else '2'))
+        if line:
+            parts = line.split('\t', 1)
+            duplicates.append((parts[0], parts[1] if len(parts) > 1 else '2'))
 
 def md(value):
-    value = str(value or '-')
-    return value.replace('|', '\\|').replace('\n', ' ')
+    return str(value or '-').replace('|', '\\|').replace('\n', ' ')
 
 def code(value):
     return f'`{md(value)}`'
 
-rows.sort(key=lambda r: (
-    r.get('Environment', ''),
-    r.get('Project', ''),
-    r.get('FQDN', ''),
-    r.get('VirtualService', ''),
-))
-issues.sort(key=lambda r: (
-    r.get('Environment', ''),
-    r.get('Project', ''),
-    r.get('FQDN', ''),
-))
-
+rows.sort(key=lambda r: (r.get('Environment',''), r.get('Project',''), r.get('HTTPS_URL','')))
+issues.sort(key=lambda r: (r.get('Environment',''), r.get('Project',''), r.get('HTTPS_URL','')))
 now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 with open(output_file, 'w', encoding='utf-8') as out:
-    out.write('# EKS Istio VirtualService – External FQDN & Routing Inventory\n\n')
+    out.write('# EKS Istio VirtualService – External FQDN Inventory\n\n')
 
     out.write('## Overview\n\n')
-    out.write('This page provides an inventory of external FQDNs configured in Istio VirtualService manifests across application Git repositories.\n\n')
-    out.write('The inventory is generated from Kubernetes/Istio manifests stored in the Git/VS Code workspace. Kubernetes internal hosts ending in `.svc.cluster.local` are excluded.\n\n')
+    out.write('This page provides an inventory of external HTTPS URLs configured from Istio VirtualService hosts across application Git repositories.\n\n')
+    out.write('Kubernetes internal hosts ending in `.svc.cluster.local` are excluded.\n\n')
     out.write(f'**Last Generated:** {now}  \n')
     out.write(f'**Source:** Git repositories under `{search_root}`  \n')
     out.write('**Resource:** Istio VirtualService  \n')
     out.write('**Internal Hosts:** Excluded  \n')
-    out.write('**Generation Method:** Automated manifest scan\n\n')
+    out.write('**URL Scheme:** HTTPS\n\n')
     out.write('---\n\n')
 
     out.write('## Summary\n\n')
-    out.write('| Metric | Count |\n')
-    out.write('|---|---:|\n')
+    out.write('| Metric | Count |\n|---|---:|\n')
     out.write(f'| Projects Scanned | {total_projects} |\n')
     out.write(f'| YAML Files Scanned | {files_scanned} |\n')
-    out.write(f'| VirtualService/FQDN Mappings | {total_records} |\n')
-    out.write(f'| Unique External FQDNs | {total_fqdns} |\n')
+    out.write(f'| VirtualService/URL Mappings | {total_records} |\n')
+    out.write(f'| Unique External HTTPS URLs | {total_urls} |\n')
     out.write(f'| Validation Issues | {total_issues} |\n')
-    out.write(f'| Duplicate FQDNs | {duplicate_count} |\n')
+    out.write(f'| Duplicate URLs | {duplicate_count} |\n')
     out.write(f'| Internal Hosts Excluded | {internal_excluded} |\n\n')
     out.write('---\n\n')
 
-    out.write('## External FQDN & Routing Inventory\n\n')
-    out.write('| Environment | Project | Namespace | VirtualService | External FQDN | Gateway | Mesh Routing | Destination Service | Port | URI | Status |\n')
-    out.write('|---|---|---|---|---|---|---|---|---:|---|---|\n')
+    out.write('## External FQDN Inventory\n\n')
+    out.write('| Environment | Project | Namespace | VirtualService | HTTPS URL | Destination Port | Git Remote | Manifest |\n')
+    out.write('|---|---|---|---|---|---:|---|---|\n')
     if rows:
-        for row in rows:
-            out.write(
-                '| {env} | {project} | {namespace} | {vs} | {fqdn} | {gateway} | {mesh} | {dest} | {port} | {uri} | {status} |\n'.format(
-                    env=md(row.get('Environment')),
-                    project=md(row.get('Project')),
-                    namespace=md(row.get('Namespace')),
-                    vs=md(row.get('VirtualService')),
-                    fqdn=code(row.get('FQDN')),
-                    gateway=code(row.get('Gateway')),
-                    mesh=md(row.get('MeshRouting')),
-                    dest=md(row.get('DestinationService')),
-                    port=md(row.get('DestinationPort')),
-                    uri=code(row.get('URIPrefix')),
-                    status=md(row.get('Status')),
-                )
-            )
+        for r in rows:
+            out.write(f"| {md(r.get('Environment'))} | {md(r.get('Project'))} | {md(r.get('Namespace'))} | {md(r.get('VirtualService'))} | {code(r.get('HTTPS_URL'))} | {md(r.get('DestinationPort'))} | {md(r.get('GitRemote'))} | {code(r.get('Manifest'))} |\n")
     else:
-        out.write('| - | - | - | - | - | - | - | - | - | - | No external FQDNs found |\n')
+        out.write('| - | - | - | - | - | - | - | No external URLs found |\n')
     out.write('\n---\n\n')
 
     out.write('## Validation Issues\n\n')
-    out.write('| Environment | Project | VirtualService | FQDN | Issue |\n')
+    out.write('| Environment | Project | VirtualService | HTTPS URL | Issue |\n')
     out.write('|---|---|---|---|---|\n')
     if issues:
-        for issue in issues:
-            out.write(
-                f"| {md(issue.get('Environment'))} | {md(issue.get('Project'))} | {md(issue.get('VirtualService'))} | {code(issue.get('FQDN'))} | {md(issue.get('Issue'))} |\n"
-            )
+        for i in issues:
+            out.write(f"| {md(i.get('Environment'))} | {md(i.get('Project'))} | {md(i.get('VirtualService'))} | {code(i.get('HTTPS_URL'))} | {md(i.get('Issue'))} |\n")
     else:
         out.write('| - | - | - | - | No validation issues found |\n')
     out.write('\n---\n\n')
 
-    out.write('## Duplicate FQDNs\n\n')
-    out.write('| FQDN | Occurrences |\n')
-    out.write('|---|---:|\n')
+    out.write('## Duplicate URLs\n\n')
+    out.write('| HTTPS URL | Occurrences |\n|---|---:|\n')
     if duplicates:
-        for fqdn, count in duplicates:
-            out.write(f'| {code(fqdn)} | {md(count)} |\n')
+        for url, count in duplicates:
+            out.write(f'| {code(url)} | {md(count)} |\n')
     else:
         out.write('| - | 0 |\n')
     out.write('\n---\n\n')
 
     out.write('## Validation Rules\n\n')
     out.write('- Excludes `*.svc.cluster.local`.\n')
-    out.write('- Treats `mesh` as an Istio reserved gateway value rather than a Kubernetes Gateway resource.\n')
-    out.write('- Reports `mesh` separately as **Mesh Routing**.\n')
-    out.write('- Validates non-mesh Gateway references against Gateway manifests in the same Git repository.\n')
-    out.write('- Validates external FQDN syntax.\n')
-    out.write('- Detects wildcard FQDNs.\n')
-    out.write('- Detects duplicate external FQDNs.\n')
-    out.write('- Reports a missing manifest namespace as `UNKNOWN`.\n')
-    out.write('- Determines environment primarily from the final namespace suffix such as `-prod`, `-dev`, or `-shadow`; FQDN and manifest path are fallbacks.\n')
-    out.write('- Captures HTTP route destination service and port.\n')
-    out.write('- Captures HTTP URI prefix.\n\n')
-    out.write('---\n\n')
-
-    out.write('## Status Definitions\n\n')
-    out.write('| Status | Description |\n')
-    out.write('|---|---|\n')
-    out.write('| `VALID` | Configuration passed static validation |\n')
-    out.write('| `WILDCARD` | VirtualService uses a wildcard hostname |\n')
-    out.write('| `NONSTANDARD` | Host does not match expected FQDN syntax |\n')
-    out.write('| `MISSING_GATEWAY` | No explicit Gateway or mesh routing is configured |\n')
-    out.write('| `GATEWAY_HOST_MISMATCH` | FQDN was not found on the referenced non-mesh Gateway |\n\n')
+    out.write('- Adds the `https://` prefix to each reported external host.\n')
+    out.write('- Determines environment primarily from the namespace suffix, then FQDN, then manifest path.\n')
+    out.write('- Detects malformed and wildcard hostnames.\n')
+    out.write('- Uses Gateway data internally for static validation but does not display Gateway details in the primary report.\n')
+    out.write('- Detects duplicate external HTTPS URLs.\n\n')
     out.write('---\n\n')
 
     out.write('## Important Notes\n\n')
-    out.write('Environment detection uses the namespace suffix as the primary source. For example, `aadt-ddx-ddd-prod` is `PROD`, `aadt-exec-dev` is `DEV`, and `aadt-exec-shadow` is `SHADOW`.\n\n')
-    out.write('`mesh` is an Istio reserved gateway value and is not a Kubernetes Gateway resource. It is therefore shown separately from the external Gateway in this report.\n\n')
-    out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest. The namespace may be supplied by Kustomize, Helm, Argo CD, or the deployment pipeline.\n\n')
-    out.write('This report performs static Git manifest analysis and does not verify live EKS resources, DNS resolution, TLS certificates, load balancers, destination Services, or application availability.\n')
+    out.write('The `https://` prefix is added for reporting convenience. This static report does not verify that TLS is configured or that the URL is reachable.\n\n')
+    out.write('A namespace of `UNKNOWN` means `metadata.namespace` was not explicitly defined in the manifest.\n\n')
+    out.write('This report analyzes Git manifests only and does not verify live EKS resources, DNS resolution, certificates, load balancers, or application availability.\n')
 PY
 
 echo
@@ -745,17 +575,15 @@ echo "============================================================"
 echo "Search root:              $SEARCH_ROOT"
 echo "YAML files scanned:       $FILES_SCANNED"
 echo "Projects:                 $TOTAL_PROJECTS"
-echo "Unique external FQDNs:    $TOTAL_FQDNS"
+echo "Unique external URLs:     $TOTAL_URLS"
 echo "Validation issues:        $TOTAL_ISSUES"
-echo "Duplicate FQDNs:          $DUP_COUNT"
+echo "Duplicate URLs:           $DUP_COUNT"
 echo "Internal hosts excluded:  $INTERNAL_HOSTS_EXCLUDED"
 
 if [[ "$DRY_RUN" == true ]]; then
   echo
   echo "DRY-RUN: No report files were written to:"
   echo "  $REQUESTED_OUTPUT_DIR"
-  echo
-  echo "The temporary reports will be removed automatically."
   echo
   echo "==================== DRY-RUN REPORT PREVIEW ===================="
   cat "$TEXT_FILE"
@@ -765,6 +593,6 @@ else
   echo "CSV report:               $CSV_FILE"
   echo "Text report:              $TEXT_FILE"
   echo "Issues report:            $ISSUES_FILE"
-  echo "Duplicate FQDN list:      $DUP_FILE"
+  echo "Duplicate URL list:       $DUP_FILE"
   echo "Confluence report:        $CONFLUENCE_FILE"
 fi
